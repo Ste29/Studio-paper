@@ -1,0 +1,175 @@
+# `parfitt_trb` — Parfitt–Collins brand-share prediction
+
+A faithful, tested implementation of Parfitt & Collins (1968), *Use of Consumer
+Panels for Brand-Share Prediction*, JMR 5(2):131–145.
+
+```
+Market Share = Trial (penetration) × Repeat (RBR) × Buying index
+```
+
+It predicts the **stabilised** share of a launched (or promoted) brand from
+continuous panel data, long before the share settles in the raw sales series.
+
+---
+
+## Why dual-backend
+
+Almost every step is a `groupBy` whose **output is tiny** (a ~100-point
+penetration series, an RBR series, a few scalars) — the per-shopper dimension
+always collapses. So the code is split in two:
+
+- **`aggregation.py`** — the *only* backend-specific code. `PandasAggregator`
+  (local dev, tests, figures) and `SparkAggregator` (production scale) each run
+  the same logical reductions and return identical small pandas tables.
+- **everything else** (`core.py`, `model.py`, `plots.py`) — one shared
+  pandas/numpy core that never sees a DataFrame engine.
+
+```python
+from parfitt_trb import TRBConfig, run_trb
+
+cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14)
+res = run_trb(transactions_pandas, cfg)                  # local
+res = run_trb(transactions_spark,  cfg, backend="spark") # production (same code below)
+```
+
+Tests are backend-parametrised: the pandas path always runs; the Spark parity
+test is auto-skipped where `pyspark`/Java are absent (e.g. this dev machine) and
+validates pandas≡Spark where they exist.
+
+---
+
+## Input schema
+
+One row per purchase line (column names configurable in `TRBConfig`):
+
+| column           | meaning                                    | default name     |
+|------------------|--------------------------------------------|------------------|
+| card             | loyalty-card / household id                | `shopper_id`     |
+| date             | purchase date                              | `txn_date`       |
+| brand flag       | line is the studied brand (bool)           | `is_new_product` |
+| category flag    | line is in the reference category (bool)   | `is_category`    |
+| measure          | quantity (volume / units / value)          | `volume`         |
+
+The brand is part of the category (`treat_brand_as_category=True` ORs it in).
+
+---
+
+## What it computes
+
+| Quantity | How | Faithful to |
+|---|---|---|
+| **Trial / penetration** `P(t)=ΣN/ΣF` | cumulative brand triers / category triers, weekly | appendix |
+| **Ultimate penetration `K`** | fit `ΔP(t)=a(K−P(t))` (centred diff) by **discounted least squares** (Gilchrist, w=0.6) → `P(t)=K(1−e^{−at})` | appendix, Fig 18 |
+| **RBR `R(t,s)`** | pooled brand/category volume over rolling intervals anchored to each shopper's trial, lapsed buyers kept, **furthest available interval** taken (r→∞ proxy) | §RBR, Table 1 |
+| **Buying index `B`** | avg category volume of brand buyers / of all category buyers, on the analysis window; **base = triers** by default (`repeaters` optional) | Fig 17 |
+| **Share (simple)** | `K × R(last) × B` | p.133, Fig 17 |
+| **Share (segmented)** | `Σ Pᵢ × Rᵢ × Bᵢ` over entry cohorts + estimated future cohort | **Table 2** |
+| **p.w.s.d.** | weighted RMS relative penetration-forecast error (w=0.6) | appendix, Fig 19 |
+| **Promotion effect** | baseline fit before a cutoff vs realised vs re-fit after → "bought" penetration | Fig 12–15 |
+
+### Key modelling decisions (and where they diverge)
+
+- **Weekly compute, monthly display.** Everything is computed on uniform 7-day
+  periods (so the DLS fit sees equal spacing); `display.rollup_*` aggregate to
+  `YYYY-MM` for presentation, treating months as fixed-length (a small, accepted
+  distortion).
+- **Share uses the *projected* `K`** (`predict_share_projected`), faithful to the
+  appendix. `predict_share(rbr)` is the simple `trial × rbr × buying` multiplier
+  used in the paper's worked example (34%×25%×1.00=8.5%).
+- **No automatic RBR-stability detection** (your call): the share takes the last
+  available interval; `detect_plateau()` is a *diagnostic* only, and the RBR plot
+  shows whether it had really levelled off. If the last interval is a thin tail,
+  pass an explicit value: `res.predict_share_projected(rbr_value=...)`, or cap it
+  with `TRBConfig(max_interval=...)`.
+- **Cohort share is a sum of contributions, not of RBRs.** `Σ Pᵢ Rᵢ Bᵢ`; the
+  single "blended" RBR reported (`blended_rbr`) is the penetration-weighted
+  average, never a sum.
+- **RBR interval modes** (`rbr_interval_mode`): `"exact"` = `period_length_days`
+  windows from each shopper's exact trial date; `"bucket"` = calendar weeks or
+  months after the trial bucket (`rbr_bucket_unit`), so RBR(5) is the 5th
+  week/month after the trial week/month.
+- **Cohort RBR caveat.** Each cohort's rate is read at its furthest available
+  interval; at that interval only the *earliest* members of a wide entry window
+  are present, biasing the estimate. Keep entry cohorts narrow (the default
+  6-week windows) or set custom `cohort_boundaries_weeks` to isolate a sub-group
+  (e.g. a price-cut wave).
+
+---
+
+## Quick start
+
+```python
+from parfitt_trb import TRBConfig, run_trb
+from parfitt_trb import plots
+
+cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14,  # 2-week RBR interval
+                analysis_date="2024-09-30")                       # "as of" date
+res = run_trb(df, cfg)
+
+res.trial_index                 # observed penetration snapshot
+res.penetration.ultimate_penetration   # projected K
+res.ultimate_rbr()              # (interval, rate) furthest available
+res.buying_index                # overall B (triers)
+res.segmented_share()           # Σ Pᵢ Rᵢ Bᵢ   <- headline equilibrium share
+res.cohort_table()              # Table 2 as a DataFrame
+plots.plot_dashboard(res)       # penetration | RBR | predicted share
+```
+
+`TRBConfig` reference: see `config.py` (penetration_method, discount_weight,
+penetration_denominator, rbr_interval_mode, rbr_bucket_unit, buying_index_base,
+repeater_min_purchases, buying_index_window_days, cohort_boundaries_weeks,
+include_prelaunch_cohort, max_interval).
+
+### Calendar granularity (penetration / share / per-period buying index)
+
+By default these calendar-time series are computed and labelled on **weekly**
+periods. Two knobs change that (RBR has its own axis; entry cohorts stay weekly):
+
+- `period_unit="month"` — compute and display on calendar months (`YYYY-MM`).
+  `"week"` (default) labels each period with its ISO week (`YYYY-Www`).
+- `bucket_column="YEARWEEK"` (or any precomputed label column) — **overrides**
+  `period_unit`: the axis becomes a dense chronological ordinal over the observed
+  labels, so non-daily feeds (weekly/monthly transactions) and labels that cross
+  a year boundary (`2023-W52 → 2024-W01`) become consecutive periods 1..N.
+
+```python
+res = run_trb(df, TRBConfig(launch_date="2024-01-01", period_unit="month"))
+res.period_unit            # 'month'
+res.label(3)               # '2024-03'  (period ordinal -> calendar label)
+from parfitt_trb.display import label_ratio, label_cumulative
+label_ratio(res.share_series, res.period_labels)        # [('2024-01', 0.06), ...]
+label_cumulative(res.penetration.series, res.period_labels)
+```
+
+---
+
+## Run it
+
+```powershell
+uv run pytest tests/ -v                       # 19 pandas tests; Spark parity skipped here
+uv run python -m examples.replicate_paper_figures   # -> examples/figures/*.png
+uv run python -m examples.usage_template            # full analysis printout + dashboard
+```
+
+`examples/usage_template.py` is the template to copy for a real analysis.
+
+---
+
+## Paper-figure replication
+
+`examples/replicate_paper_figures.py` reproduces the **single-dataset** figures
+from engineered synthetic panels (`examples/synth.py`):
+
+- Fig 1/3 & 6 — cumulative penetration (success / failure) + projection
+- Fig 2/4 & 7 — repeat-buying rate (success / failure)
+- Fig 5 — realised share by period
+- Fig 9 — penetration by entry cohort + Table 2 reconstruction
+- Fig 10 — seasonality inflating apparent (household) penetration
+- Fig 12–15 — promotion vs baseline projection ("bought" penetration)
+- Fig 17 — the `P × B × R` concept
+- Fig 18 — early projection from 12 weeks of data
+
+**Out of scope** (need data this single-analysis tool doesn't have): Fig 8
+(predicted-vs-actual scatter over 24 brands), Fig 11 (31 case studies), Fig 16
+(psychographic segments — not in the transaction schema), Fig 19 (multi-case
+p.w.s.d. scatter; the p.w.s.d. *value* is still computed per analysis).

@@ -1,0 +1,84 @@
+"""Configuration for the Parfitt-Collins (TRB) brand-share model.
+
+Everything tunable lives in :class:`TRBConfig` so nothing is a hidden constant.
+The defaults are chosen so the small worked examples in the tests run unchanged.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+
+@dataclass(frozen=True)
+class TRBConfig:
+    # --- input schema (column names of the transaction DataFrame) ----------- #
+    card_column: str = "shopper_id"        # loyalty-card / household id
+    date_column: str = "txn_date"          # purchase date (string or date)
+    brand_column: str = "is_new_product"   # boolean: line is the studied brand
+    category_column: str = "is_category"   # boolean: line is in the category
+    measure: str = "volume"                # quantity column used as `qty`
+
+    # --- calendar axis (penetration / share / per-period buying index) ------ #
+    # Granularity of the calendar-time periods. RBR has its own axis (see below)
+    # and entry COHORTS are always weekly (Parfitt Table 2); this only sets the
+    # axis the penetration curve, the realised-share series and the per-period
+    # buying index are computed and displayed on.
+    period_unit: str = "week"              # 'week' | 'month' (derived from dates)
+    bucket_column: Optional[str] = None    # precomputed calendar-bucket label
+                                           # (e.g. 'YYYY-MM' or ISO 'YYYY-Www').
+                                           # When set it OVERRIDES period_unit:
+                                           # the axis becomes a dense chronological
+                                           # ordinal over the observed labels, so
+                                           # non-daily panels (weekly/monthly feeds)
+                                           # and cross-year labels (…-W52 -> …-W01)
+                                           # are handled directly.
+
+    # --- window of the analysis -------------------------------------------- #
+    launch_date: Optional[str] = None      # if set, the calendar origin & trial floor
+    analysis_date: Optional[str] = None    # "as of" date; default = max purchase date
+
+    # --- category handling -------------------------------------------------- #
+    treat_brand_as_category: bool = True   # OR the brand flag into the category flag
+
+    # --- penetration model -------------------------------------------------- #
+    penetration_method: str = "discounted"     # 'discounted' (Gilchrist) | 'ols'
+    discount_weight: float = 0.6               # Gilchrist lambda (paper uses 0.6)
+    penetration_denominator: str = "dynamic"   # 'dynamic' (cum. F) | 'static' (F_tot)
+
+    # --- repeat-buying rate (RBR) ------------------------------------------ #
+    rbr_interval_mode: str = "exact"       # 'exact' (P-day windows) | 'bucket'
+    period_length_days: int = 28           # length s of one RBR interval (exact mode)
+    rbr_bucket_unit: str = "week"          # 'week' | 'month' (bucket mode)
+    max_interval: Optional[int] = None     # cap on interval t (default = max feasible)
+
+    # --- buying-rate index -------------------------------------------------- #
+    buying_index_base: str = "triers"      # 'triers' (Parfitt) | 'repeaters' (Charan)
+    repeater_min_purchases: int = 2        # >= this many brand buys => repeater
+    buying_index_window_days: Optional[int] = None  # None = all history up to analysis
+
+    # --- entry cohorts (Table 2) ------------------------------------------- #
+    # week boundaries; (6, 12, 24) => [1-6], [7-12], [13-24], [25+]
+    cohort_boundaries_weeks: Tuple[int, ...] = (6, 12, 24)
+    include_prelaunch_cohort: bool = False  # treat pre-launch brand buyers as a cohort
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.discount_weight <= 1.0:
+            raise ValueError("discount_weight must be in (0, 1]")
+        if self.period_length_days <= 0:
+            raise ValueError("period_length_days must be positive")
+        if self.repeater_min_purchases < 2:
+            raise ValueError("a repeater needs at least 2 brand purchases")
+        if self.penetration_method not in ("discounted", "ols"):
+            raise ValueError("penetration_method must be 'discounted' or 'ols'")
+        if self.penetration_denominator not in ("dynamic", "static"):
+            raise ValueError("penetration_denominator must be 'dynamic' or 'static'")
+        if self.period_unit not in ("week", "month"):
+            raise ValueError("period_unit must be 'week' or 'month'")
+        if self.rbr_interval_mode not in ("exact", "bucket"):
+            raise ValueError("rbr_interval_mode must be 'exact' or 'bucket'")
+        if self.rbr_bucket_unit not in ("week", "month"):
+            raise ValueError("rbr_bucket_unit must be 'week' or 'month'")
+        if self.buying_index_base not in ("triers", "repeaters"):
+            raise ValueError("buying_index_base must be 'triers' or 'repeaters'")
+        if tuple(self.cohort_boundaries_weeks) != tuple(sorted(set(self.cohort_boundaries_weeks))):
+            raise ValueError("cohort_boundaries_weeks must be strictly increasing & unique")

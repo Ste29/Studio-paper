@@ -1,0 +1,122 @@
+"""TEMPLATE for a TRB brand-share analysis. Copy this and swap the data source.
+
+Run:  uv run python -m examples.usage_template
+
+The flow mirrors how an analyst reads a launch:
+  1. realised market share over time (all we have up to the analysis date);
+  2. penetration so far + the projected ultimate level (and, if a promotion ran,
+     how the realised curve diverged from the baseline and the re-fitted ultimate);
+  3. repeat-buying rate by interval and by entry cohort;
+  4. the final expected (equilibrium) share = Σ Pᵢ × Rᵢ × Bᵢ.
+
+PRODUCTION NOTE: the only change for the real single-retailer panel is the data
+source and the backend flag:
+    res = run_trb(spark_df, cfg, backend="spark")
+The Spark aggregator runs the heavy group-bys on the cluster; everything below is
+identical because it operates on the small, card-collapsed series.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+from parfitt_trb import TRBConfig, penetration_vs_actual, pwsd, run_trb
+from parfitt_trb import plots
+from parfitt_trb.display import rollup_cumulative, rollup_ratio
+from examples.synth import simulate_panel
+
+OUT = os.path.join(os.path.dirname(__file__), "figures")
+os.makedirs(OUT, exist_ok=True)
+
+
+def main():
+    # --- 0. Data -----------------------------------------------------------
+    # Here: a simulated launch with a price promotion at week 18. In production,
+    # replace this with your transaction DataFrame (and backend="spark").
+    PROMO_WEEK = 18
+    df = simulate_panel(n_households=6000, weeks=40, K=0.24, a=0.22,
+                        rbr_start=0.42, rbr_stable=0.24, cat_interval=2, seed=11,
+                        promo_week=PROMO_WEEK, promo_K=0.12, promo_rbr=0.07)
+    cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14,
+                    buying_index_base="triers")
+    # Calendar granularity of penetration / share / per-period buying index:
+    #   period_unit="month"     -> compute & label these on calendar months
+    #   bucket_column="YEARWEEK" -> use a precomputed label column instead (handles
+    #                              weekly/monthly feeds and cross-year labels).
+    # Either way res.label(period) gives the calendar label; the default below is
+    # weekly, then coarsened to months for the printout via rollup_ratio.
+    res = run_trb(df, cfg)                      # backend="spark" in production
+    pen = res.penetration
+
+    # --- 1. Realised market share over time --------------------------------
+    print("=" * 64)
+    print("1. MARKET SHARE OVER TIME (realised, to the analysis date)")
+    monthly_share = rollup_ratio(res.share_series, res.origin)
+    for m, s in monthly_share[-6:]:
+        print(f"   {m}: {s*100:5.1f}%" if s is not None else f"   {m}:   n/a")
+
+    # --- 2. Penetration: observed, projected, promotion divergence ---------
+    print("\n2. PENETRATION")
+    print(f"   observed trial index (snapshot)   = {res.trial_index*100:5.1f}% "
+          f"of category buyers")
+    if pen.ultimate_penetration:
+        print(f"   projected ultimate penetration K  = {pen.ultimate_penetration*100:5.1f}% "
+              f"(growth a = {pen.growth_rate:.3f}/week)")
+        # model fit quality on the penetration curve (appendix p.w.s.d.)
+        actual = [p for _, p in pen.series]
+        fitted = [pen.fitted(t) for t, _ in pen.series]
+        print(f"   penetration fit p.w.s.d.          = {pwsd(actual, fitted)*100:.2f}%")
+    if pen.note:
+        print(f"   note: {pen.note}")
+
+    promo = penetration_vs_actual(pen, cutoff_period=PROMO_WEEK, method="discounted")
+    if promo.baseline_K is not None and promo.refit_K is not None:
+        print(f"   promotion @week {PROMO_WEEK}: baseline K={promo.baseline_K*100:.1f}% "
+              f"-> re-fit K={promo.refit_K*100:.1f}% "
+              f"(bought ~ {promo.bought_penetration*100:+.1f}pp of penetration)")
+
+    # --- 3. Repeat-buying rate by interval and by cohort -------------------
+    print("\n3. REPEAT-BUYING RATE")
+    ur = res.ultimate_rbr()
+    if ur:
+        print(f"   furthest-available RBR = {ur[1]*100:.1f}% (interval {ur[0]})")
+    plat = res.detect_plateau()
+    if plat:
+        print(f"   (diagnostic) levels off near {plat[1]*100:.1f}% from interval {plat[0]}")
+    print("\n   By entry cohort (segmented / Table 2 model):")
+    print(res.cohort_table().to_string(index=False, formatters={
+        "penetration": "{:.3f}".format,
+        "rbr": (lambda v: "" if v is None else f"{v:.3f}"),
+        "buying_index": (lambda v: "" if v is None else f"{v:.3f}"),
+        "contribution": "{:.4f}".format}))
+
+    # --- 4. Final expected share ------------------------------------------
+    print("\n4. EXPECTED EQUILIBRIUM SHARE")
+    print(f"   simple   K x R(last) x B = {res.predict_share_projected()*100:5.2f}%")
+    print(f"   segmented  Σ Pᵢ Rᵢ Bᵢ    = {res.segmented_share()*100:5.2f}%")
+    print(f"   buying index (overall)   = {res.buying_index:.3f}")
+    print("=" * 64)
+
+    # --- Dashboard figure --------------------------------------------------
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    plots.plot_share_over_time(res, ax=axes[0][0])
+    plots.plot_penetration_promo(promo, ax=axes[0][1])
+    plots.plot_rbr(res, ax=axes[1][0], mark_plateau=True)
+    plots.plot_cohort_contributions(res, ax=axes[1][1])
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "usage_template_dashboard.png"), dpi=110)
+    plt.close(fig)
+    print("wrote figures/usage_template_dashboard.png")
+
+
+if __name__ == "__main__":
+    main()
