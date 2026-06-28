@@ -12,29 +12,31 @@ continuous panel data, long before the share settles in the raw sales series.
 
 ---
 
-## Why dual-backend
+## Why a single Spark engine
 
 Almost every step is a `groupBy` whose **output is tiny** (a ~100-point
 penetration series, an RBR series, a few scalars) — the per-shopper dimension
 always collapses. So the code is split in two:
 
-- **`aggregation.py`** — the *only* backend-specific code. `PandasAggregator`
-  (local dev, tests, figures) and `SparkAggregator` (production scale) each run
-  the same logical reductions and return identical small pandas tables.
-- **everything else** (`core.py`, `model.py`, `plots.py`) — one shared
-  pandas/numpy core that never sees a DataFrame engine.
+- **`aggregation.py`** — the *only* engine-specific code (`SparkAggregator`).
+  Every heavy join / group-by (trial identification, interval & period
+  assignment, the RBR and buying reductions) runs **in Spark**; only the small,
+  already-aggregated tables (one row per interval / period / cohort / scope) are
+  collected. No transaction-level or per-card frame is ever pulled to the driver,
+  so it scales to a real single-retailer panel of millions of lines.
+- **everything else** (`core.py`, `model.py`, `plots.py`) — one numpy/pandas core
+  that only ever sees those small tables.
 
 ```python
 from parfitt_trb import TRBConfig, run_trb
 
 cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14)
-res = run_trb(transactions_pandas, cfg)                  # local
-res = run_trb(transactions_spark,  cfg, backend="spark") # production (same code below)
+res = run_trb(transactions_spark, cfg)   # transactions_spark is a Spark DataFrame
 ```
 
-Tests are backend-parametrised: the pandas path always runs; the Spark parity
-test is auto-skipped where `pyspark`/Java are absent (e.g. this dev machine) and
-validates pandas≡Spark where they exist.
+The hand-computed anchor tests (traceable to the paper) run through Spark and pin
+the Spark column expressions; `parfitt_trb.local_spark.build_local_spark()` gives
+a resource-limited local session for tests and the examples.
 
 ---
 
@@ -101,6 +103,10 @@ The brand is part of the category (`treat_brand_as_category=True` ORs it in).
 ```python
 from parfitt_trb import TRBConfig, run_trb
 from parfitt_trb import plots
+from parfitt_trb.local_spark import build_local_spark
+
+spark = build_local_spark()           # local/dev; in production use the cluster session
+df = spark.createDataFrame(transactions_pandas)   # or read straight from the lake
 
 cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14,  # 2-week RBR interval
                 analysis_date="2024-09-30")                       # "as of" date
@@ -145,8 +151,12 @@ label_cumulative(res.penetration.series, res.period_labels)
 
 ## Run it
 
+Spark needs a working **Java** runtime (JDK 17+). Everything runs on the
+resource-limited local session (`local[2]`, 1 GB), so the suite is slower than a
+pure in-memory run but uses the same engine as production.
+
 ```powershell
-uv run pytest tests/ -v                       # 19 pandas tests; Spark parity skipped here
+uv run pytest tests/ -v                       # hand-computed anchors, run on Spark
 uv run python -m examples.replicate_paper_figures   # -> examples/figures/*.png
 uv run python -m examples.usage_template            # full analysis printout + dashboard
 ```

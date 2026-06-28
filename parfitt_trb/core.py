@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -309,7 +309,7 @@ def share_series(share_long: pd.DataFrame) -> List[Tuple[int, Optional[float], f
 # --------------------------------------------------------------------------- #
 # Segmented (cohort) model -- Table 2
 # --------------------------------------------------------------------------- #
-def build_cohorts(trials: pd.DataFrame, rbr_cohort: pd.DataFrame,
+def build_cohorts(cohort_counts: Mapping[str, int], rbr_cohort: pd.DataFrame,
                   buying_scopes: pd.DataFrame, n_category_triers: int,
                   cohort_order: Sequence[str], *,
                   ultimate_penetration: Optional[float] = None) -> List[Cohort]:
@@ -318,8 +318,10 @@ def build_cohorts(trials: pd.DataFrame, rbr_cohort: pd.DataFrame,
     Pᵢ = brand triers entering in cohort i / F_tot (so Σ observed Pᵢ = snapshot).
     Rᵢ = cohort's furthest-available RBR. Bᵢ = cohort buying index.
     Future cohort: P=K-Σobserved, R=last cohort's R, B=1.0 (point 5 / Table 2).
+
+    `cohort_counts` maps each entry-cohort label to its number of brand triers.
     """
-    counts = trials.groupby("cohort").size().to_dict()
+    counts = dict(cohort_counts)
     # furthest available RBR per cohort
     rbr_by_cohort: Dict[str, Tuple[int, float]] = {}
     if not rbr_cohort.empty:

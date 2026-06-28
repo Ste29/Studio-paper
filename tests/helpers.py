@@ -17,5 +17,10 @@ def make_df(rows: List[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def make_sdf(spark, rows: List[dict]):
+    """Build a Spark transaction DataFrame from compact rows (via pandas)."""
+    return spark.createDataFrame(make_df(rows))
+
+
 def approx(a, b, tol=1e-9):
     return a is not None and abs(a - b) <= tol

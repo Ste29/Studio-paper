@@ -24,21 +24,23 @@ def _ax(ax, figsize=(7, 4.5)):
     return ax
 
 
-def _calendar_xlabel(result: TRBResult) -> str:
+def _calendar_xlabel(result: TRBResult, share: bool = False) -> str:
     """X-axis label for a calendar-axis chart, matching the period unit."""
-    unit = getattr(result, "period_unit", "week")
+    unit = getattr(result, "share_period_unit" if share else "period_unit", "week")
     return {"week": "Weeks after launch", "month": "Months after launch",
             "bucket": "Calendar bucket"}.get(unit, "Periods after launch")
 
 
-def _calendar_ticks(ax, result: TRBResult, periods: Sequence[int]) -> None:
-    """For month / bucket axes, label the ticks with calendar labels (YYYY-MM,
-    YYYY-Www, or the bucket label) instead of bare ordinals. Weekly axes keep the
-    numeric 'weeks after launch' ticks (there can be many)."""
-    if getattr(result, "period_unit", "week") == "week" or not periods:
+def _calendar_ticks(ax, result: TRBResult, periods: Sequence[int],
+                    share: bool = False) -> None:
+    """For month / bucket axes, label the ticks with calendar labels instead of
+    bare ordinals. Weekly axes keep numeric ticks (there can be many)."""
+    unit = getattr(result, "share_period_unit" if share else "period_unit", "week")
+    if unit == "week" or not periods:
         return
+    labeller = result.label_share if share else result.label
     ax.set_xticks(list(periods))
-    ax.set_xticklabels([result.label(p) for p in periods], rotation=45, ha="right",
+    ax.set_xticklabels([labeller(p) for p in periods], rotation=45, ha="right",
                        fontsize=7)
 
 
@@ -142,9 +144,9 @@ def plot_share_bars(result: TRBResult, ax=None, as_percent: bool = True,
     if not pts:
         raise ValueError("no share series to plot")
     ax.bar([t for t, _ in pts], [r * scale for _, r in pts], color="tab:blue", alpha=0.8)
-    ax.set(xlabel=_calendar_xlabel(result), ylabel="Share %" if as_percent else "Share",
+    ax.set(xlabel=_calendar_xlabel(result, share=True), ylabel="Share %" if as_percent else "Share",
            title=title)
-    _calendar_ticks(ax, result, [t for t, _ in pts])
+    _calendar_ticks(ax, result, [t for t, _ in pts], share=True)
     ax.set_ylim(bottom=0)
     return ax
 
@@ -169,9 +171,9 @@ def plot_share_over_time(result: TRBResult, ax=None, as_percent: bool = True,
             ax.annotate(f"Parfitt equilibrium {eq * scale:.1f}{unit}",
                         xy=(pts[-1][0], eq * scale), ha="right", va="bottom",
                         fontsize=8, color="grey")
-    ax.set(xlabel=_calendar_xlabel(result),
+    ax.set(xlabel=_calendar_xlabel(result, share=True),
            ylabel=f"Share {unit}".strip(), title=title)
-    _calendar_ticks(ax, result, [t for t, _ in pts])
+    _calendar_ticks(ax, result, [t for t, _ in pts], share=True)
     ax.set_ylim(bottom=0)
     ax.legend(fontsize=8)
     return ax

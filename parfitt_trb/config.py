@@ -33,6 +33,18 @@ class TRBConfig:
                                            # and cross-year labels (…-W52 -> …-W01)
                                            # are handled directly.
 
+    # --- share axis (optional override) ------------------------------------- #
+    # When set, the REALISED SHARE series uses a different calendar axis from the
+    # penetration / buying-index series. Useful when the panel has both a weekly
+    # label (ISOWEEKYEAR → penetration) and a monthly label (YEARMONTH → share)
+    # precomputed, and the business wants them on different granularities.
+    # Either or both of the fields below can be set independently:
+    #   share_bucket_column  overrides the bucket column for share_long only.
+    #   share_period_unit    overrides period_unit for share_long when no bucket.
+    # If neither is set, share_long uses the main calendar axis (default).
+    share_bucket_column: Optional[str] = None   # e.g. 'YEARMONTH'
+    share_period_unit: Optional[str] = None     # 'week' | 'month'; None = same as period_unit
+
     # --- window of the analysis -------------------------------------------- #
     launch_date: Optional[str] = None      # if set, the calendar origin & trial floor
     analysis_date: Optional[str] = None    # "as of" date; default = max purchase date
@@ -74,6 +86,8 @@ class TRBConfig:
             raise ValueError("penetration_denominator must be 'dynamic' or 'static'")
         if self.period_unit not in ("week", "month"):
             raise ValueError("period_unit must be 'week' or 'month'")
+        if self.share_period_unit is not None and self.share_period_unit not in ("week", "month"):
+            raise ValueError("share_period_unit must be 'week' or 'month'")
         if self.rbr_interval_mode not in ("exact", "bucket"):
             raise ValueError("rbr_interval_mode must be 'exact' or 'bucket'")
         if self.rbr_bucket_unit not in ("week", "month"):
