@@ -1,7 +1,7 @@
 """Replicate the single-dataset figures of Parfitt & Collins (1968) with the
 library, to demonstrate its analytical range. Run:
 
-    uv run python examples/replicate_paper_figures.py
+    uv run python -m examples.replicate_paper_figures
 
 PNGs are written to examples/figures/. Each function notes the paper figure(s)
 it reproduces. Figures requiring multi-case aggregates (8, 11, 19) or
@@ -26,8 +26,9 @@ import pandas as pd
 
 from parfitt_trb import TRBConfig, penetration_vs_actual, run_trb
 from parfitt_trb import plots
-from parfitt_trb.aggregation import PandasAggregator
+from parfitt_trb.aggregation import SparkAggregator
 from parfitt_trb.cohorts import cohort_order
+from parfitt_trb.local_spark import build_local_spark
 from examples.synth import simulate_panel
 
 OUT = os.path.join(os.path.dirname(__file__), "figures")
@@ -42,10 +43,11 @@ def save(fig, name: str) -> None:
 
 
 # --- Fig 1/3 + 2/4 + 5 + 18: a successful launch (Brand T / Signal) --------- #
-def successful_brand():
+def successful_brand(spark):
     df = simulate_panel(n_households=5000, weeks=40, K=0.34, a=0.18,
                         rbr_start=0.46, rbr_stable=0.25, cat_interval=2, seed=1)
-    res = run_trb(df, TRBConfig(**CFG))
+    sdf = spark.createDataFrame(df)
+    res = run_trb(sdf, TRBConfig(**CFG))
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     plots.plot_penetration(res, ax=ax, title="Fig 1/3 — Cumulative penetration (success)")
@@ -60,7 +62,7 @@ def successful_brand():
     save(fig, "fig05_share_bars.png")
 
     # Fig 18: fit on the first 12 weeks only, project forward (early prediction)
-    early = run_trb(df, TRBConfig(analysis_date="2024-03-25", **CFG))
+    early = run_trb(sdf, TRBConfig(analysis_date="2024-03-25", **CFG))
     fig, ax = plt.subplots(figsize=(7, 4.5))
     plots.plot_penetration(early, ax=ax, project_to=40,
                            title="Fig 18 — Early projection from 12 weeks of data")
@@ -69,10 +71,10 @@ def successful_brand():
 
 
 # --- Fig 6/7: a failure (good penetration, very low repeat) ------------------ #
-def failed_brand():
+def failed_brand(spark):
     df = simulate_panel(n_households=5000, weeks=32, K=0.17, a=0.30,
                         rbr_start=0.20, rbr_stable=0.06, cat_interval=2, seed=2)
-    res = run_trb(df, TRBConfig(**CFG))
+    res = run_trb(spark.createDataFrame(df), TRBConfig(**CFG))
     fig, ax = plt.subplots(figsize=(7, 4.5))
     plots.plot_penetration(res, ax=ax, title="Fig 6 — Cumulative penetration (Brand Y, failure)")
     save(fig, "fig06_penetration_failure.png")
@@ -82,27 +84,30 @@ def failed_brand():
 
 
 # --- Fig 9: penetration analysed by entry cohort (Table 2) ------------------- #
-def cohorts_brand_b():
+def cohorts_brand_b(spark):
     def stable(wt):
         return 0.30 if wt <= 6 else (0.18 if wt <= 12 else 0.10)
     df = simulate_panel(n_households=5000, weeks=44, entry_weeks=24, K=0.30, a=0.16,
                         rbr_start=0.42, rbr_stable=0.10, decay=0.7,
                         cat_interval=2, seed=4, stable_by_week=stable)
     cfg = TRBConfig(**CFG)
-    res = run_trb(df, cfg)
-    agg = PandasAggregator(df, cfg)
-    trials, F = agg.trials, agg.n_category_triers
+    sdf = spark.createDataFrame(df)
+    res = run_trb(sdf, cfg)
+    agg = SparkAggregator(sdf, cfg)
+    F = agg.n_category_triers
+    tcw = agg.trier_counts_by_entry_week()        # small: entry_week, cohort, n
     order = cohort_order(cfg.cohort_boundaries_weeks, False)
-    maxw = int(trials["entry_week"].max())
+    maxw = int(tcw["entry_week"].max())
     xs = list(range(1, maxw + 1))
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bottoms = np.zeros(maxw)
     for label in order:
         counts = np.zeros(maxw)
-        for w in trials.loc[trials["cohort"] == label, "entry_week"]:
+        sub = tcw[tcw["cohort"] == label]
+        for w, n in zip(sub["entry_week"], sub["n"]):
             if 1 <= w <= maxw:
-                counts[int(w) - 1] += 1
+                counts[int(w) - 1] += int(n)
         cumc = np.cumsum(counts) / F * 100
         ax.fill_between(xs, bottoms, bottoms + cumc, alpha=0.75, label=label)
         bottoms = bottoms + cumc
@@ -131,7 +136,7 @@ def cohorts_brand_b():
 
 
 # --- Fig 10: seasonality inflates apparent penetration ---------------------- #
-def seasonal_brand_j():
+def seasonal_brand_j(spark):
     rng = np.random.default_rng(3)
     H, weeks = 5000, 32
     origin = date(2024, 1, 1)
@@ -152,8 +157,9 @@ def seasonal_brand_j():
     df = pd.DataFrame(rows, columns=["shopper_id", "txn_date", "is_new_product",
                                      "is_category", "volume"])
     cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14)
-    res = run_trb(df, cfg, project_penetration=False)
-    agg = PandasAggregator(df, cfg)
+    sdf = spark.createDataFrame(df)
+    res = run_trb(sdf, cfg, project_penetration=False)
+    agg = SparkAggregator(sdf, cfg)
     ent = agg.entrants().sort_values("period")
     cb = ent["n_brand_new"].cumsum().to_numpy() / H * 100        # brand % households
     cf = ent["n_cat_new"].cumsum().to_numpy() / H * 100          # field % households
@@ -172,12 +178,12 @@ def seasonal_brand_j():
 
 
 # --- Fig 12-15: a promotion lifts penetration above the baseline projection -- #
-def promotion_effect():
+def promotion_effect(spark):
     df = simulate_panel(n_households=5000, weeks=36, K=0.22, a=0.30,
                         rbr_start=0.40, rbr_stable=0.22, cat_interval=2, seed=7,
                         promo_week=18, promo_K=0.14, promo_rbr=0.06)
     cfg = TRBConfig(**CFG)
-    res = run_trb(df, cfg)
+    res = run_trb(spark.createDataFrame(df), cfg)
     promo = penetration_vs_actual(res.penetration, cutoff_period=18, method="discounted")
     fig, ax = plt.subplots(figsize=(7, 4.5))
     plots.plot_penetration_promo(promo, ax=ax,
@@ -204,12 +210,16 @@ def concept_waterfall():
 
 def main():
     print("Replicating Parfitt-Collins single-dataset figures -> examples/figures/")
-    successful_brand()
-    failed_brand()
-    cohorts_brand_b()
-    seasonal_brand_j()
-    promotion_effect()
-    concept_waterfall()
+    spark = build_local_spark("trb-figures")
+    try:
+        successful_brand(spark)
+        failed_brand(spark)
+        cohorts_brand_b(spark)
+        seasonal_brand_j(spark)
+        promotion_effect(spark)
+        concept_waterfall()                 # pure plot, no data engine needed
+    finally:
+        spark.stop()
     print("Done. (Figures 8, 11, 16, 19 are out of scope -- see README.)")
 
 

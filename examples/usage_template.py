@@ -10,10 +10,11 @@ The flow mirrors how an analyst reads a launch:
   4. the final expected (equilibrium) share = Σ Pᵢ × Rᵢ × Bᵢ.
 
 PRODUCTION NOTE: the only change for the real single-retailer panel is the data
-source and the backend flag:
-    res = run_trb(spark_df, cfg, backend="spark")
-The Spark aggregator runs the heavy group-bys on the cluster; everything below is
-identical because it operates on the small, card-collapsed series.
+source and the SparkSession. Here we build a small *local* session (the engine is
+the same as production); on the cluster you pass your own session's DataFrame:
+    res = run_trb(spark_df, cfg)
+The Spark aggregator runs every heavy group-by on the cluster and only collects
+the small, card-collapsed series; everything below is identical.
 """
 from __future__ import annotations
 
@@ -31,7 +32,8 @@ except Exception:
 
 from parfitt_trb import TRBConfig, penetration_vs_actual, pwsd, run_trb
 from parfitt_trb import plots
-from parfitt_trb.display import rollup_cumulative, rollup_ratio
+from parfitt_trb.display import rollup_ratio
+from parfitt_trb.local_spark import build_local_spark
 from examples.synth import simulate_panel
 
 OUT = os.path.join(os.path.dirname(__file__), "figures")
@@ -43,18 +45,22 @@ def main():
     # Here: a simulated launch with a price promotion at week 18. In production,
     # replace this with your transaction DataFrame (and backend="spark").
     PROMO_WEEK = 18
-    df = simulate_panel(n_households=6000, weeks=40, K=0.24, a=0.22,
-                        rbr_start=0.42, rbr_stable=0.24, cat_interval=2, seed=11,
-                        promo_week=PROMO_WEEK, promo_K=0.12, promo_rbr=0.07)
+    pdf = simulate_panel(n_households=6000, weeks=40, K=0.24, a=0.22,
+                         rbr_start=0.42, rbr_stable=0.24, cat_interval=2, seed=11,
+                         promo_week=PROMO_WEEK, promo_K=0.12, promo_rbr=0.07)
+    spark = build_local_spark("trb-usage-template")
+    df = spark.createDataFrame(pdf)            # in production: your cluster DataFrame
     cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14,
                     buying_index_base="triers")
     # Calendar granularity of penetration / share / per-period buying index:
-    #   period_unit="month"     -> compute & label these on calendar months
-    #   bucket_column="YEARWEEK" -> use a precomputed label column instead (handles
-    #                              weekly/monthly feeds and cross-year labels).
-    # Either way res.label(period) gives the calendar label; the default below is
-    # weekly, then coarsened to months for the printout via rollup_ratio.
-    res = run_trb(df, cfg)                      # backend="spark" in production
+    #   period_unit="month"      -> compute & label these on calendar months
+    #   period_unit="iso_week"   -> ISO calendar weeks ('YYYY-Www', cross-year safe)
+    #   period_unit="fiscal_445" -> retail 4-4-5 periods ('YYYY-Pnn')
+    # The iso_week / fiscal_445 axes live on the real calendar grid, so an
+    # out-of-stock week with no sales keeps its slot instead of collapsing.
+    # res.label(period) gives the calendar label; the default below is weekly,
+    # then coarsened to months for the printout via rollup_ratio.
+    res = run_trb(df, cfg)                      
     pen = res.penetration
 
     # --- 1. Realised market share over time --------------------------------
@@ -116,6 +122,7 @@ def main():
     fig.savefig(os.path.join(OUT, "usage_template_dashboard.png"), dpi=110)
     plt.close(fig)
     print("wrote figures/usage_template_dashboard.png")
+    spark.stop()
 
 
 if __name__ == "__main__":

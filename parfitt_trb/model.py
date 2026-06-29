@@ -1,6 +1,6 @@
-"""Orchestrator: compose the aggregation backend with the modelling core.
+"""Orchestrator: compose the Spark aggregation layer with the modelling core.
 
-`run_trb(transactions, cfg, backend=...)` is the single entry point. It returns a
+`run_trb(transactions, cfg)` is the single entry point. It returns a
 :class:`TRBResult` holding every series the analyst needs plus convenience
 predictors. The old single-method classes (TrialIdentifier, RBRCalculator, ...)
 are gone -- their logic now lives as plain functions in ``core``/``aggregation``.
@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .aggregation import Aggregator, PandasAggregator, SparkAggregator
+from .aggregation import SparkAggregator
 from .cohorts import cohort_order
 from .config import TRBConfig
 from .core import (
@@ -36,13 +36,19 @@ class TRBResult:
     share_series: List[Tuple[int, Optional[float], float, float]] = field(default_factory=list)
     config: Optional[TRBConfig] = None
     # calendar axis the period-indexed series above live on: 'week' | 'month' |
-    # 'bucket', plus the period-ordinal -> calendar-label map for display.
+    # 'iso_week' | 'fiscal_445', plus the period-ordinal -> calendar-label map.
     period_unit: str = "week"
     period_labels: Dict[int, str] = field(default_factory=dict)
+    share_period_unit: str = "week"
+    share_period_labels: Dict[int, str] = field(default_factory=dict)
 
     def label(self, period: int) -> str:
-        """Calendar label for a period ordinal (falls back to the ordinal)."""
+        """Calendar label for a period ordinal on the main axis (falls back to ordinal)."""
         return self.period_labels.get(int(period), str(int(period)))
+
+    def label_share(self, period: int) -> str:
+        """Calendar label for a period ordinal on the share axis."""
+        return self.share_period_labels.get(int(period), str(int(period)))
 
     # -- RBR accessors ------------------------------------------------------ #
     def rbr_at(self, interval: int) -> Optional[float]:
@@ -110,19 +116,17 @@ class TRBResult:
 
 
 def run_trb(transactions, cfg: TRBConfig = TRBConfig(), *,
-            backend: str = "pandas", project_penetration: bool = True) -> TRBResult:
-    """End-to-end run. `transactions` is a pandas DataFrame (backend='pandas')
-    or a Spark DataFrame (backend='spark')."""
-    if backend == "pandas":
-        agg: Aggregator = PandasAggregator(transactions, cfg)
-    elif backend == "spark":
-        agg = SparkAggregator(transactions, cfg)
-    else:
-        raise ValueError("backend must be 'pandas' or 'spark'")
-    return _assemble(agg, cfg, project_penetration)
+            project_penetration: bool = True) -> TRBResult:
+    """End-to-end run. `transactions` is a Spark DataFrame; all heavy work runs
+    in Spark and only the small modelling tables are collected."""
+    agg = SparkAggregator(transactions, cfg)
+    try:
+        return _assemble(agg, cfg, project_penetration)
+    finally:
+        agg.close()                       # release the cached Spark DataFrames
 
 
-def _assemble(agg: Aggregator, cfg: TRBConfig, project: bool) -> TRBResult:
+def _assemble(agg: SparkAggregator, cfg: TRBConfig, project: bool) -> TRBResult:
     pen = build_penetration(agg.entrants(), agg.origin, cfg.penetration_denominator)
     if project:
         fit_penetration(pen, method=cfg.penetration_method,
@@ -134,14 +138,14 @@ def _assemble(agg: Aggregator, cfg: TRBConfig, project: bool) -> TRBResult:
     bi = 1.0 if bi is None else bi
 
     order = cohort_order(cfg.cohort_boundaries_weeks, cfg.include_prelaunch_cohort)
-    cohorts = build_cohorts(agg.trials, agg.rbr_cohort(), scopes,
+    cohorts = build_cohorts(agg.cohort_counts(), agg.rbr_cohort(), scopes,
                             agg.n_category_triers, order,
                             ultimate_penetration=pen.ultimate_penetration)
 
     share = share_series(agg.share_long())
     bidx = buying_index_series(agg.buying_series())
-    all_periods = ({p for p, _ in pen.series}
-                   | {p for p, *_ in share} | {p for p, _ in bidx})
+    main_periods = ({p for p, _ in pen.series} | {p for p, _ in bidx})
+    share_periods = {p for p, *_ in share}
     return TRBResult(
         trial_index=pen.snapshot,
         buying_index=bi,
@@ -153,6 +157,8 @@ def _assemble(agg: Aggregator, cfg: TRBConfig, project: bool) -> TRBResult:
         buying_index_series=bidx,
         share_series=share,
         config=cfg,
-        period_unit=getattr(agg, "period_unit", "week"),
-        period_labels=agg.period_labels(all_periods),
+        period_unit=agg.period_unit,
+        period_labels=agg.period_labels(main_periods),
+        share_period_unit=agg.share_period_unit,
+        share_period_labels=agg.share_period_labels(share_periods),
     )

@@ -2,8 +2,9 @@
 
     Market Share = Trial (penetration) × Repeat (RBR) × Buying Index
 
-Faithful to Parfitt & Collins (1968), JMR 5(2):131-145. Dual-backend: a pandas
-core for local work and a Spark aggregation mirror for production scale.
+Faithful to Parfitt & Collins (1968), JMR 5(2):131-145. The data layer runs on
+Spark (all heavy group-bys on the cluster, only small aggregates collected); the
+modelling core is plain numpy/pandas on those small tables.
 """
 from .config import TRBConfig
 from .core import (

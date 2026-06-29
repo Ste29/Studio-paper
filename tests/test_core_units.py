@@ -11,17 +11,14 @@ from parfitt_trb import TRBConfig, pwsd, run_trb
 from parfitt_trb.core import (
     Penetration, blended_rbr, build_cohorts, penetration_vs_actual, segmented_share,
 )
-from tests.helpers import approx, make_df, row
+from tests.helpers import approx, make_sdf, row
 
 
 # --------------------------------------------------------------------------- #
 # Segmented model (Table 2 mechanics)
 # --------------------------------------------------------------------------- #
 def test_cohort_reconstruction():
-    trials = pd.DataFrame({
-        "card": [f"a{i}" for i in range(150)],
-        "cohort": ["1-6w"] * 100 + ["7-12w"] * 50,
-    })
+    cohort_counts = {"1-6w": 100, "7-12w": 50}
     rbr_cohort = pd.DataFrame([
         {"cohort": "1-6w", "interval": 1, "brand_qty": 30, "cat_qty": 100},
         {"cohort": "1-6w", "interval": 2, "brand_qty": 20, "cat_qty": 100},   # last -> 0.20
@@ -33,7 +30,7 @@ def test_cohort_reconstruction():
         {"scope": "1-6w", "sum_cat": 100, "n_buyers": 100},        # B = 1.0
         {"scope": "7-12w", "sum_cat": 50, "n_buyers": 50},          # B = 1.0
     ])
-    cohorts = build_cohorts(trials, rbr_cohort, scopes, n_category_triers=1000,
+    cohorts = build_cohorts(cohort_counts, rbr_cohort, scopes, n_category_triers=1000,
                             cohort_order=["1-6w", "7-12w", "13-24w", "25+w"],
                             ultimate_penetration=0.30)
     by = {c.label: c for c in cohorts}
@@ -75,37 +72,37 @@ def test_penetration_vs_actual_promo():
 # --------------------------------------------------------------------------- #
 # RBR bucket mode (calendar weeks / months after the trial bucket)
 # --------------------------------------------------------------------------- #
-def test_rbr_bucket_week():
+def test_rbr_bucket_week(spark):
     rows = [
         row("x", "2024-01-01", True, True, 5),     # trial (Monday)
         row("x", "2024-02-05", True, True, 4),     # exactly 5 calendar weeks later
         row("x", "2024-02-05", False, True, 6),
     ]
-    res = run_trb(make_df(rows),
+    res = run_trb(make_sdf(spark, rows),
                   TRBConfig(rbr_interval_mode="bucket", rbr_bucket_unit="week",
                             analysis_date="2024-06-01"))
     assert approx(res.rbr_at(5), 0.4), res.rbr_at(5)
 
 
-def test_rbr_bucket_month():
+def test_rbr_bucket_month(spark):
     rows = [
         row("x", "2024-01-10", True, True, 5),     # trial in month 2024-01
         row("x", "2024-06-15", True, True, 3),     # 5 months later
         row("x", "2024-06-15", False, True, 7),
     ]
-    res = run_trb(make_df(rows),
+    res = run_trb(make_sdf(spark, rows),
                   TRBConfig(rbr_interval_mode="bucket", rbr_bucket_unit="month",
                             analysis_date="2024-12-31"))
     assert approx(res.rbr_at(5), 0.3), res.rbr_at(5)
 
 
 # --------------------------------------------------------------------------- #
-def test_plotting_smoke():
+def test_plotting_smoke(spark):
     import matplotlib
     matplotlib.use("Agg")
     from parfitt_trb import plots
 
-    res = run_trb(make_df([
+    res = run_trb(make_sdf(spark, [
         row("anita", "2024-01-01", True, True, 5),
         row("anita", "2024-05-15", True, True, 10),
         row("anita", "2024-05-15", False, True, 10),
