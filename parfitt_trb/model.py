@@ -36,7 +36,7 @@ class TRBResult:
     share_series: List[Tuple[int, Optional[float], float, float]] = field(default_factory=list)
     config: Optional[TRBConfig] = None
     # calendar axis the period-indexed series above live on: 'week' | 'month' |
-    # 'bucket', plus the period-ordinal -> calendar-label map for display.
+    # 'iso_week' | 'fiscal_445', plus the period-ordinal -> calendar-label map.
     period_unit: str = "week"
     period_labels: Dict[int, str] = field(default_factory=dict)
     share_period_unit: str = "week"

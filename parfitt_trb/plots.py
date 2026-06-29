@@ -28,13 +28,15 @@ def _calendar_xlabel(result: TRBResult, share: bool = False) -> str:
     """X-axis label for a calendar-axis chart, matching the period unit."""
     unit = getattr(result, "share_period_unit" if share else "period_unit", "week")
     return {"week": "Weeks after launch", "month": "Months after launch",
-            "bucket": "Calendar bucket"}.get(unit, "Periods after launch")
+            "iso_week": "ISO calendar week", "fiscal_445": "Retail 4-4-5 period",
+            }.get(unit, "Periods after launch")
 
 
 def _calendar_ticks(ax, result: TRBResult, periods: Sequence[int],
                     share: bool = False) -> None:
-    """For month / bucket axes, label the ticks with calendar labels instead of
-    bare ordinals. Weekly axes keep numeric ticks (there can be many)."""
+    """For non-weekly axes (month / iso_week / fiscal_445), label the ticks with
+    calendar labels instead of bare ordinals. Weekly axes keep numeric ticks
+    (there can be many)."""
     unit = getattr(result, "share_period_unit" if share else "period_unit", "week")
     if unit == "week" or not periods:
         return

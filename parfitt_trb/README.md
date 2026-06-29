@@ -18,9 +18,11 @@ Almost every step is a `groupBy` whose **output is tiny** (a ~100-point
 penetration series, an RBR series, a few scalars) — the per-shopper dimension
 always collapses. So the code is split in two:
 
-- **`aggregation.py`** — the *only* engine-specific code (`SparkAggregator`).
-  Every heavy join / group-by (trial identification, interval & period
-  assignment, the RBR and buying reductions) runs **in Spark**; only the small,
+- **`aggregation/`** — the *only* engine-specific code (`SparkAggregator`), split
+  by theme: `calendar.py` (date dimension + axis descriptors), `_expr.py` (Spark
+  column expressions), `aggregator.py` (the class). Every heavy join / group-by
+  (trial identification, interval & period assignment, the RBR and buying
+  reductions) runs **in Spark**; only the small,
   already-aggregated tables (one row per interval / period / cohort / scope) are
   collected. No transaction-level or per-card frame is ever pulled to the driver,
   so it scales to a real single-retailer panel of millions of lines.
@@ -131,12 +133,17 @@ include_prelaunch_cohort, max_interval).
 By default these calendar-time series are computed and labelled on **weekly**
 periods. Two knobs change that (RBR has its own axis; entry cohorts stay weekly):
 
-- `period_unit="month"` — compute and display on calendar months (`YYYY-MM`).
-  `"week"` (default) labels each period with its ISO week (`YYYY-Www`).
-- `bucket_column="YEARWEEK"` (or any precomputed label column) — **overrides**
-  `period_unit`: the axis becomes a dense chronological ordinal over the observed
-  labels, so non-daily feeds (weekly/monthly transactions) and labels that cross
-  a year boundary (`2023-W52 → 2024-W01`) become consecutive periods 1..N.
+- `period_unit="week"` (default) / `"month"` — origin-relative 7-day / calendar
+  month buckets, derived by date arithmetic. `"week"` labels each period with its
+  ISO week (`YYYY-Www`); `"month"` with `YYYY-MM`.
+- `period_unit="iso_week"` / `"fiscal_445"` — **calendar-anchored** axes built
+  from a date dimension over `[origin, analysis]`. `iso_week` uses ISO calendar
+  weeks (`YYYY-Www`, handling `2023-W52 → 2024-W01` and 53-week years);
+  `fiscal_445` uses retail 4-4-5 periods (`YYYY-Pnn`). Because they live on the
+  real calendar grid, a bucket with **no sales** (e.g. an out-of-stock week)
+  keeps its slot instead of collapsing onto its neighbour.
+- `share_period_unit` (optional) puts the realised-share series on a *different*
+  axis from penetration (e.g. penetration on `iso_week`, share on `month`).
 
 ```python
 res = run_trb(df, TRBConfig(launch_date="2024-01-01", period_unit="month"))

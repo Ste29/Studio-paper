@@ -53,12 +53,14 @@ def main():
     cfg = TRBConfig(launch_date="2024-01-01", period_length_days=14,
                     buying_index_base="triers")
     # Calendar granularity of penetration / share / per-period buying index:
-    #   period_unit="month"     -> compute & label these on calendar months
-    #   bucket_column="YEARWEEK" -> use a precomputed label column instead (handles
-    #                              weekly/monthly feeds and cross-year labels).
-    # Either way res.label(period) gives the calendar label; the default below is
-    # weekly, then coarsened to months for the printout via rollup_ratio.
-    res = run_trb(df, cfg)                      # backend="spark" in production
+    #   period_unit="month"      -> compute & label these on calendar months
+    #   period_unit="iso_week"   -> ISO calendar weeks ('YYYY-Www', cross-year safe)
+    #   period_unit="fiscal_445" -> retail 4-4-5 periods ('YYYY-Pnn')
+    # The iso_week / fiscal_445 axes live on the real calendar grid, so an
+    # out-of-stock week with no sales keeps its slot instead of collapsing.
+    # res.label(period) gives the calendar label; the default below is weekly,
+    # then coarsened to months for the printout via rollup_ratio.
+    res = run_trb(df, cfg)                      
     pen = res.penetration
 
     # --- 1. Realised market share over time --------------------------------

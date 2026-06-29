@@ -4,12 +4,12 @@ Two ways to label periods for output:
 
 * ``label_ratio`` / ``label_cumulative`` take a period-ordinal -> calendar-label
   map (``TRBResult.period_labels``) and present the series on whatever calendar
-  axis the model computed it (week / month / bucket). Use these when the axis is
-  already at the granularity you want to show.
+  axis the model computed it (week / month / iso_week / fiscal_445). Use these
+  when the axis is already at the granularity you want to show.
 * ``rollup_ratio`` / ``rollup_cumulative`` additionally COARSEN a weekly axis to
   ``YYYY-MM`` months (the original point-8 rollup). They assume a weekly base
-  axis; with ``period_unit='month'`` or a ``bucket_column`` use the ``label_*``
-  helpers instead, since the series is already monthly/bucketed.
+  axis; with a calendar-anchored ``period_unit`` (month / iso_week / fiscal_445)
+  use the ``label_*`` helpers instead, since the series is already bucketed.
 
 Ratio series (share, buying index) are aggregated by re-summing their
 numerator/denominator components; cumulative series (penetration) take the last

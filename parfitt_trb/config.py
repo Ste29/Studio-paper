@@ -8,6 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+# Canonical calendar-axis unit sets (single source of truth, shared with the
+# aggregation layer). DERIVED units are origin-relative date arithmetic;
+# CALENDAR (anchored) units live on the real calendar grid via a date dimension.
+DERIVED_UNITS = ("week", "month")
+CALENDAR_UNITS = ("iso_week", "fiscal_445")
+PERIOD_UNITS = DERIVED_UNITS + CALENDAR_UNITS
+
 
 @dataclass(frozen=True)
 class TRBConfig:
@@ -23,27 +30,20 @@ class TRBConfig:
     # and entry COHORTS are always weekly (Parfitt Table 2); this only sets the
     # axis the penetration curve, the realised-share series and the per-period
     # buying index are computed and displayed on.
-    period_unit: str = "week"              # 'week' | 'month' (derived from dates)
-    bucket_column: Optional[str] = None    # precomputed calendar-bucket label
-                                           # (e.g. 'YYYY-MM' or ISO 'YYYY-Www').
-                                           # When set it OVERRIDES period_unit:
-                                           # the axis becomes a dense chronological
-                                           # ordinal over the observed labels, so
-                                           # non-daily panels (weekly/monthly feeds)
-                                           # and cross-year labels (…-W52 -> …-W01)
-                                           # are handled directly.
+    #   'week'  / 'month'      : derived by date arithmetic from the launch origin
+    #                            (origin-relative 7-day / calendar-month buckets).
+    #   'iso_week'             : ISO calendar weeks ('YYYY-Www', cross-year safe).
+    #   'fiscal_445'           : retail 4-4-5 periods ('YYYY-Pnn').
+    # The 'iso_week'/'fiscal_445' axes live on the real calendar grid (built from a
+    # date dimension), so a bucket with no sales (e.g. an out-of-stock week) keeps
+    # its slot instead of collapsing onto its neighbour.
+    period_unit: str = "week"              # 'week' | 'month' | 'iso_week' | 'fiscal_445'
 
     # --- share axis (optional override) ------------------------------------- #
     # When set, the REALISED SHARE series uses a different calendar axis from the
-    # penetration / buying-index series. Useful when the panel has both a weekly
-    # label (ISOWEEKYEAR → penetration) and a monthly label (YEARMONTH → share)
-    # precomputed, and the business wants them on different granularities.
-    # Either or both of the fields below can be set independently:
-    #   share_bucket_column  overrides the bucket column for share_long only.
-    #   share_period_unit    overrides period_unit for share_long when no bucket.
-    # If neither is set, share_long uses the main calendar axis (default).
-    share_bucket_column: Optional[str] = None   # e.g. 'YEARMONTH'
-    share_period_unit: Optional[str] = None     # 'week' | 'month'; None = same as period_unit
+    # penetration / buying-index series -- e.g. penetration on ISO weeks but the
+    # share reported on calendar months. None = share uses the main axis.
+    share_period_unit: Optional[str] = None     # same domain as period_unit; None = same
 
     # --- window of the analysis -------------------------------------------- #
     launch_date: Optional[str] = None      # if set, the calendar origin & trial floor
@@ -84,10 +84,10 @@ class TRBConfig:
             raise ValueError("penetration_method must be 'discounted' or 'ols'")
         if self.penetration_denominator not in ("dynamic", "static"):
             raise ValueError("penetration_denominator must be 'dynamic' or 'static'")
-        if self.period_unit not in ("week", "month"):
-            raise ValueError("period_unit must be 'week' or 'month'")
-        if self.share_period_unit is not None and self.share_period_unit not in ("week", "month"):
-            raise ValueError("share_period_unit must be 'week' or 'month'")
+        if self.period_unit not in PERIOD_UNITS:
+            raise ValueError(f"period_unit must be one of {PERIOD_UNITS}")
+        if self.share_period_unit is not None and self.share_period_unit not in PERIOD_UNITS:
+            raise ValueError(f"share_period_unit must be one of {PERIOD_UNITS} or None")
         if self.rbr_interval_mode not in ("exact", "bucket"):
             raise ValueError("rbr_interval_mode must be 'exact' or 'bucket'")
         if self.rbr_bucket_unit not in ("week", "month"):

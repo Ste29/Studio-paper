@@ -1,15 +1,10 @@
-"""Backend aggregation layer (Spark only).
+"""The single Spark aggregator: turns a raw transaction log into the small,
+card-collapsed modelling tables.
 
-This is the ONLY place the DataFrame engine appears. It turns a raw transaction
-log into a handful of small, card-collapsed tables with a fixed schema;
-everything downstream (``core``, ``model``, ``plots``) is engine-free and works
-on those small pandas tables.
-
-The whole point of this module is *where* the per-shopper dimension collapses:
-EVERY heavy join / group-by runs in Spark, and only the already-aggregated
-result (one row per interval / period / cohort / scope) is `.toPandas()`-ed. No
-transaction-level or per-card frame is ever pulled to the driver, so it scales
-to a real single-retailer panel of millions of lines.
+EVERY heavy join / group-by runs in Spark, and only the already-aggregated result
+(one row per interval / period / cohort / scope) is ``.toPandas()``-ed. No
+transaction-level or per-card frame is ever pulled to the driver, so it scales to
+a real single-retailer panel of millions of lines.
 
 Contract (all small pandas DataFrames):
   entrants()    : period, n_brand_new, n_cat_new
@@ -27,141 +22,13 @@ from typing import Dict
 
 import pandas as pd
 
-from .cohorts import cohort_order
-from .config import TRBConfig
-from .periods import _MONDAY_EPOCH, as_date, month_index, period_label
+from ..cohorts import cohort_order
+from ..config import TRBConfig
+from ..periods import as_date, month_index
+from ._expr import _cohort_col, _interval_col, _max_interval_col, _period_col
+from .calendar import _period_labels, axis_maps
 
 
-# --------------------------------------------------------------------------- #
-# Calendar / share axis descriptors (operate on the small set of distinct
-# labels, so they stay in pandas and are shared with the label rendering).
-# --------------------------------------------------------------------------- #
-def _build_bucket_map(first_dates: pd.Series) -> dict:
-    """Dense chronological ordinal map {label: 1..N} from a Series indexed by
-    bucket label holding each label's first observed date."""
-    return {b: i for i, b in enumerate(first_dates.sort_values().index, start=1)}
-
-
-def _build_share_axis_from_dates(cfg: TRBConfig, first_dates, origin,
-                                  fallback_bucket_to_period: dict = None) -> dict:
-    """Build the share-axis descriptor used by share_long / share_period_labels.
-
-    `first_dates` is a pandas Series indexed by bucket label -> first observed
-    date (one row per distinct label, so it is tiny). Pass None when no separate
-    share bucket column is configured.
-
-    Returns a dict with keys: cfg_proxy, origin_month, bucket_to_period, bucket_col.
-    When no separate share axis is configured the dict mirrors the main axis so
-    callers never need to branch.
-    """
-    has_share_bucket = cfg.share_bucket_column is not None and first_dates is not None
-    has_share_unit = cfg.share_period_unit is not None
-
-    if not has_share_bucket and not has_share_unit:
-        # Same axis as main — pass through using the main bucket map.
-        return {"cfg_proxy": cfg, "origin_month": month_index(origin),
-                "bucket_to_period": fallback_bucket_to_period or {}, "bucket_col": "bucket"}
-
-    if has_share_bucket:
-        bucket_map = _build_bucket_map(first_dates)
-        # cfg_proxy: present the share_bucket_column as bucket_column so the
-        # period column / label code take the bucket-mode paths.
-        frame_col = ("share_bucket" if cfg.share_bucket_column != cfg.bucket_column
-                     else "bucket")
-        proxy = TRBConfig(**{**cfg.__dict__,
-                             "bucket_column": cfg.share_bucket_column,
-                             "share_bucket_column": None})
-        return {"cfg_proxy": proxy, "origin_month": month_index(origin),
-                "bucket_to_period": bucket_map, "bucket_col": frame_col}
-
-    # Derived-date mode with a different period_unit.
-    proxy = TRBConfig(**{**cfg.__dict__,
-                         "period_unit": cfg.share_period_unit,
-                         "bucket_column": None,
-                         "share_period_unit": None})
-    return {"cfg_proxy": proxy, "origin_month": month_index(origin),
-            "bucket_to_period": {}, "bucket_col": "bucket"}
-
-
-def _period_labels(periods, cfg: TRBConfig, origin, bucket_to_period: dict) -> dict:
-    """Map calendar-axis period ordinals -> display labels. Bucket mode inverts
-    the dense ordinal map; week/month modes derive the label from the ordinal and
-    the origin. `periods` is the small set of ordinals actually used."""
-    if cfg.bucket_column is not None:
-        inv = {p: b for b, p in bucket_to_period.items()}
-        return {int(p): inv.get(int(p), str(int(p))) for p in periods}
-    return {int(p): period_label(int(p), origin, cfg.period_unit) for p in periods}
-
-
-# --------------------------------------------------------------------------- #
-# Spark column expressions for the calendar period and the RBR interval. These
-# mirror the calendar maths so the heavy reductions can run entirely in Spark.
-# --------------------------------------------------------------------------- #
-def _period_col(F, ts_col, cfg: TRBConfig, origin_iso: str, origin_month: int,
-                bucket_to_period: dict, bucket_colname: str):
-    """1-based calendar-axis period ordinal as a Spark Column. Rows before the
-    origin / with an unknown bucket map to <= 0 (callers keep period >= 1)."""
-    if cfg.bucket_column is not None:
-        if not bucket_to_period:
-            return F.lit(0)
-        pairs = []
-        for label, period in bucket_to_period.items():
-            pairs += [F.lit(label), F.lit(int(period))]
-        return F.coalesce(F.create_map(*pairs)[F.col(bucket_colname)], F.lit(0))
-    origin = F.lit(origin_iso).cast("date")
-    if cfg.period_unit == "week":
-        return F.floor(F.datediff(ts_col, origin) / 7) + 1
-    # month: (year*12 + month - 1) - origin_month + 1
-    return (F.year(ts_col) * 12 + F.month(ts_col) - 1) - F.lit(origin_month) + 1
-
-
-def _abs_week_col(F, col):
-    """floor(days since the Monday epoch / 7) — the calendar-aligned week index."""
-    return F.floor(F.datediff(col, F.lit(_MONDAY_EPOCH.isoformat()).cast("date")) / 7)
-
-
-def _month_idx_col(F, col):
-    return F.year(col) * 12 + F.month(col) - 1
-
-
-def _interval_col(F, ts_col, ref_col, cfg: TRBConfig):
-    """1-based RBR interval index of `ts_col` relative to the trial `ref_col`."""
-    if cfg.rbr_interval_mode == "exact":
-        return F.ceil(F.datediff(ts_col, ref_col) / cfg.period_length_days)
-    if cfg.rbr_bucket_unit == "week":
-        return _abs_week_col(F, ts_col) - _abs_week_col(F, ref_col)
-    return _month_idx_col(F, ts_col) - _month_idx_col(F, ref_col)
-
-
-def _max_interval_col(F, trial_col, analysis_iso: str, analysis_month: int,
-                      cfg: TRBConfig):
-    """Highest RBR interval whose whole window has elapsed by the analysis date."""
-    if cfg.rbr_interval_mode == "exact":
-        adate = F.lit(analysis_iso).cast("date")
-        return F.floor(F.datediff(adate, trial_col) / cfg.period_length_days)
-    if cfg.rbr_bucket_unit == "week":
-        adate = F.lit(analysis_iso).cast("date")
-        return _abs_week_col(F, adate) - _abs_week_col(F, trial_col)
-    return F.lit(analysis_month) - _month_idx_col(F, trial_col)
-
-
-def _cohort_col(F, entry_week_col, boundaries, include_prelaunch: bool):
-    """Entry-cohort label as a Spark Column (pure when-chain, no Python UDF).
-    The label strings come from :func:`cohorts.cohort_order` so the three label
-    encodings (here, ``cohort_label``, ``cohort_order``) cannot drift."""
-    labels = cohort_order(boundaries, include_prelaunch)
-    # cohort_order: [PRELAUNCH?, one bounded label per boundary, final '+w'].
-    first_label = labels[0]                          # the <=0 / earliest bucket
-    bounded = labels[1:] if include_prelaunch else labels
-    col = F.when(entry_week_col <= 0, F.lit(first_label))
-    for b, label in zip(boundaries, bounded):        # bounded[-1] is the '+w' tail
-        col = col.when(entry_week_col <= b, F.lit(label))
-    return col.otherwise(F.lit(bounded[-1]))
-
-
-# --------------------------------------------------------------------------- #
-# Spark aggregator — the single backend.
-# --------------------------------------------------------------------------- #
 class SparkAggregator:
     """Turn a Spark transaction DataFrame into the small modelling tables.
 
@@ -218,62 +85,48 @@ class SparkAggregator:
         if c.treat_brand_as_category:
             cat = cat | F.col("is_brand")
         out = out.withColumn("is_cat", cat)
-        cols = ["card", "ts", "is_brand", "is_cat", "qty"]
-        if c.bucket_column is not None:
-            out = out.withColumn("bucket", F.col(c.bucket_column).cast("string"))
-            cols.append("bucket")
-        if c.share_bucket_column is not None and c.share_bucket_column != c.bucket_column:
-            out = out.withColumn("share_bucket", F.col(c.share_bucket_column).cast("string"))
-            cols.append("share_bucket")
-        return out.select(*cols)
+        # Collapse to the (card, day, brand/category) grain, summing qty. Sums and
+        # distinct-card counts are unchanged (the downstream aggregations are all
+        # sums or countDistinct), so this never alters a result; it just makes the
+        # working grain explicit and avoids carrying duplicate transaction lines.
+        # NOTE: this is not de-duplication -- genuinely duplicated lines have their
+        # qty summed (collapsed), not dropped.
+        grain = ["card", "ts", "is_brand", "is_cat"]
+        return out.groupBy(*grain).agg(F.sum("qty").alias("qty"))
 
     # -- calendar axis ------------------------------------------------------ #
     def _build_calendar_axis(self) -> None:
         """Prepare the calendar-time period axes. Cohorts and RBR are NOT on them.
 
-        Main axis (penetration / buying_series / entrants):
-          'week'/'month': derived from dates; bucket_column: dense ordinal.
-        Share axis (share_long only):
-          defaults to the main axis; share_bucket_column / share_period_unit
-          override it so the share can live on a different granularity."""
-        F, c = self._F, self.cfg
-        self.period_unit = "bucket" if c.bucket_column is not None else c.period_unit
+        Main axis (penetration / buying_series / entrants): period_unit.
+        Share axis (share_long only): mirrors the main axis unless share_period_unit
+        overrides it. Calendar-anchored units (iso_week / fiscal_445) get a gap-free
+        ordinal map -- built for both axes in a SINGLE date-dimension pass; the
+        derived week/month units need no map."""
+        c = self.cfg
+        self.period_unit = c.period_unit
+        self.share_period_unit = c.share_period_unit or c.period_unit
         self._origin_month = month_index(self.origin)
-        self._bucket_to_period: dict = {}
-        obs_filter = F.col("ts") >= F.lit(self._origin).cast("date")
-        if c.bucket_column is not None:
-            # one row per distinct label -> tiny
-            first = (self._p.filter(obs_filter)
-                     .groupBy("bucket").agg(F.min("ts").alias("first")).toPandas()
-                     .set_index("bucket")["first"])
-            self._bucket_to_period = _build_bucket_map(first)
-        if c.share_bucket_column is not None and c.share_bucket_column != c.bucket_column:
-            # `_prepare` already renamed the share-bucket column to 'share_bucket'.
-            first_dates = (self._p.filter(obs_filter)
-                           .groupBy(F.col("share_bucket").alias("_sb"))
-                           .agg(F.min("ts").alias("first")).toPandas()
-                           .set_index("_sb")["first"])
-        else:
-            first_dates = None
-        self._share_axis = _build_share_axis_from_dates(
-            c, first_dates, self.origin, fallback_bucket_to_period=self._bucket_to_period)
-        sp = self._share_axis["cfg_proxy"]
-        self.share_period_unit = ("bucket" if sp.bucket_column is not None
-                                  else (sp.period_unit or "week"))
+        maps = axis_maps(self._p.sparkSession, self._origin, self._adate,
+                         (self.period_unit, self.share_period_unit))
+        self._bucket_to_period = maps.get(self.period_unit, {})
+        proxy = (c if c.share_period_unit is None
+                 else TRBConfig(**{**c.__dict__, "period_unit": c.share_period_unit,
+                                   "share_period_unit": None}))
+        self._share_axis = {"cfg_proxy": proxy,
+                            "bucket_to_period": maps.get(self.share_period_unit, {})}
 
     def _main_period_col(self, ts_col=None):
         F = self._F
         return _period_col(F, ts_col if ts_col is not None else F.col("ts"),
                            self.cfg, self._origin, self._origin_month,
-                           self._bucket_to_period, "bucket")
+                           self._bucket_to_period)
 
     def period_labels(self, periods) -> dict:
         return _period_labels(periods, self.cfg, self.origin, self._bucket_to_period)
 
     def share_period_labels(self, periods) -> dict:
         sa = self._share_axis
-        if not sa["bucket_to_period"] and sa["cfg_proxy"] is self.cfg:
-            return self.period_labels(periods)
         return _period_labels(periods, sa["cfg_proxy"], self.origin, sa["bucket_to_period"])
 
     # -- trials (kept in Spark) --------------------------------------------- #
@@ -284,20 +137,16 @@ class SparkAggregator:
         brand = self._p.filter(F.col("is_brand"))
         if c.launch_date and not c.include_prelaunch_cohort:
             brand = brand.filter(F.col("ts") >= F.lit(self._origin).cast("date"))
-        if c.bucket_column is not None:
-            # F.min(struct(ts, bucket)) keeps the bucket of the earliest line.
-            m = brand.groupBy("card").agg(F.min(F.struct("ts", "bucket")).alias("m"))
-            tr = m.select("card", F.col("m.ts").alias("trial_ts"),
-                          F.col("m.bucket").alias("bucket"))
-        else:
-            tr = brand.groupBy("card").agg(F.min("ts").alias("trial_ts"))
+        tr = brand.groupBy("card").agg(F.min("ts").alias("trial_ts"))
         origin = F.lit(self._origin).cast("date")
         # entry_week: weekly stage-of-entry for Table 2 cohorts (always weekly,
         # regardless of the calendar-axis period_unit).
         tr = tr.withColumn("entry_week", F.floor(F.datediff(F.col("trial_ts"), origin) / 7) + 1)
+        # entry_period on the calendar axis -- derived from trial_ts, so it tracks
+        # the trial's real calendar position (no collapsing across empty buckets).
         tr = tr.withColumn("entry_period", _period_col(
             F, F.col("trial_ts"), c, self._origin, self._origin_month,
-            self._bucket_to_period, "bucket"))
+            self._bucket_to_period))
         tr = tr.withColumn("cohort", _cohort_col(
             F, F.col("entry_week"), c.cohort_boundaries_weeks, c.include_prelaunch_cohort))
         tr = tr.withColumn("max_interval", _max_interval_col(
@@ -327,11 +176,7 @@ class SparkAggregator:
               .groupBy("entry_period").count()
               .toPandas().rename(columns={"entry_period": "period", "count": "n_brand_new"}))
         cat = self._p.filter(F.col("is_cat") & (F.col("ts") >= F.lit(self._origin).cast("date")))
-        if self.cfg.bucket_column is not None:
-            m = cat.groupBy("card").agg(F.min(F.struct("ts", "bucket")).alias("m"))
-            first = m.select(F.col("m.ts").alias("ts"), F.col("m.bucket").alias("bucket"))
-        else:
-            first = cat.groupBy("card").agg(F.min("ts").alias("ts"))
+        first = cat.groupBy("card").agg(F.min("ts").alias("ts"))
         cw = (first.withColumn("period", self._main_period_col())
               .filter(F.col("period") >= 1).groupBy("period").count()
               .toPandas().rename(columns={"count": "n_cat_new"}))
@@ -454,7 +299,7 @@ class SparkAggregator:
         sa = self._share_axis
         d = self._p.filter(F.col("ts") >= F.lit(self._origin).cast("date"))
         period = _period_col(F, F.col("ts"), sa["cfg_proxy"], self._origin,
-                             sa["origin_month"], sa["bucket_to_period"], sa["bucket_col"])
+                             self._origin_month, sa["bucket_to_period"])
         g = (d.withColumn("period", period)
              .withColumn("bq", F.when(F.col("is_brand"), F.col("qty")).otherwise(0.0))
              .withColumn("cq", F.when(F.col("is_cat"), F.col("qty")).otherwise(0.0))
