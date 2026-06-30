@@ -19,3 +19,43 @@ mkdir src
 uv add --group dev ruff jupyterlab pytest
 
 ```
+
+## Setup pyspark
+``` powershell
+winget install Microsoft.OpenJDK.17
+
+# di solito le variabili sono impostate automaticamente
+Get-ChildItem "C:\Program Files\Microsoft" -Filter "*jdk*" -Directory
+[System.Environment]::SetEnvironmentVariable("JAVA_HOME", "C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot", "Machine")
+$currentPath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
+[System.Environment]::SetEnvironmentVariable("PATH", "$currentPath;C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot\bin", "Machine")
+
+uv add pyspark
+
+```
+
+Limita le risorse con
+
+``` python
+import os
+import sys
+
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+
+spark = SparkSession.builder \
+    .master("local[2]") \  # max 2 core, non tutti
+    .config("spark.driver.memory", "1g") \
+    .config("spark.executor.memory", "1g") \
+    .appName("poc") \
+    .getOrCreate()
+```
+
+
+## Setup claude
+
+``` powershell
+irm https://claude.ai/install.ps1 | iex
+# Spesso le variabili sono già settate
+[Environment]::SetEnvironmentVariable("PATH", "$env:PATH;$env:USERPROFILE\.local\bin", [EnvironmentVariableTarget]::User)
+```
