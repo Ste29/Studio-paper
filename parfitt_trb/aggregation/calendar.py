@@ -21,16 +21,14 @@ from __future__ import annotations
 import pandas as pd
 
 from ..config import CALENDAR_UNITS, TRBConfig
-from ..periods import period_label
+from ..periods import _MONDAY_EPOCH, _P445_THRESHOLDS, period_label
 
 # CALENDAR_UNITS (the calendar-anchored units; 'week'/'month' stay as
 # origin-relative arithmetic in :mod:`parfitt_trb.periods`) is defined in
 # :mod:`parfitt_trb.config` and re-exported here for the aggregation layer.
+# _P445_THRESHOLDS lives in :mod:`parfitt_trb.periods` (single source of truth
+# with the scalar mirror periods.p445_period).
 __all__ = ["CALENDAR_UNITS", "bucket_label_col", "build_date_dim", "axis_maps"]
-
-# Retail 4-4-5: ISO weeks 1-4 -> period 1, 5-8 -> 2, 9-13 -> 3 (4+4+5 = 13 weeks
-# per quarter), repeating; weeks 48+ fall in period 12.
-_P445_THRESHOLDS = (4, 8, 13, 17, 21, 26, 30, 34, 39, 43, 47)
 
 
 # --------------------------------------------------------------------------- #
@@ -57,12 +55,22 @@ def _p445_col(F, ts):
 def bucket_label_col(F, ts, unit: str):
     """Per-row calendar-bucket label for an anchored ``unit`` as a Spark Column.
 
-    ``iso_week``   -> ``'YYYY-Www'`` (ISO year/week, cross-year safe)
-    ``fiscal_445`` -> ``'YYYY-Pnn'`` (retail 4-4-5 period within the ISO year)
+    ``iso_week``      -> ``'YYYY-Www'`` (ISO year/week, cross-year safe)
+    ``iso_fortnight`` -> ``'YYYY-Fww'`` (pair of consecutive ISO weeks on the
+                         Monday-epoch grid, named after the pair's FIRST week)
+    ``fiscal_445``    -> ``'YYYY-Pnn'`` (retail 4-4-5 period within the ISO year)
     """
     # 'YYYY-Www' mirrors the scalar spec in periods.iso_week_label (keep in sync).
     if unit == "iso_week":
         return F.format_string("%04d-W%02d", _iso_year_col(F, ts), F.weekofyear(ts))
+    if unit == "iso_fortnight":
+        # Monday of the pair's first week; mirrors periods.fortnight_first_monday
+        # (floor(days/14) == floor(abs_week/2) on the same Monday epoch).
+        epoch = F.lit(_MONDAY_EPOCH.isoformat()).cast("date")
+        monday = F.date_add(epoch, (F.floor(F.datediff(ts, epoch) / 14) * 14)
+                            .cast("int"))
+        return F.format_string("%04d-F%02d", _iso_year_col(F, monday),
+                               F.weekofyear(monday))
     if unit == "fiscal_445":
         return F.format_string("%04d-P%02d", _iso_year_col(F, ts), _p445_col(F, ts))
     raise ValueError(f"{unit!r} is not a calendar-anchored unit {CALENDAR_UNITS}")

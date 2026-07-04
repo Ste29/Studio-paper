@@ -14,3 +14,6 @@ wheels/
 
 # Copyrighted source paper — keep locally, do not publish
 theory/Parfitt/parfitt1968.pdf
+
+# Claude Code local settings and plans
+.claude/

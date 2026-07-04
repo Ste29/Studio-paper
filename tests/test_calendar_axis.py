@@ -1,9 +1,9 @@
 """Calendar-axis tests: the penetration / realised-share / per-period buying
-index can be computed and displayed on week / month / iso_week / fiscal_445
-granularities. The calendar-anchored units (iso_week, fiscal_445) live on the
-real calendar grid via a date dimension, so empty buckets (out-of-stock weeks)
-keep their slot instead of collapsing. Cohorts stay weekly (Parfitt Table 2).
-All runs go through the Spark engine."""
+index can be computed and displayed on week / fortnight / month / iso_week /
+iso_fortnight / fiscal_445 granularities. The calendar-anchored units (iso_week,
+iso_fortnight, fiscal_445) live on the real calendar grid via a date dimension,
+so empty buckets (out-of-stock weeks) keep their slot instead of collapsing.
+Cohorts stay weekly (Parfitt Table 2). All runs go through the Spark engine."""
 from __future__ import annotations
 
 import pytest
@@ -75,6 +75,27 @@ def test_iso_week_axis_crosses_year(spark):
     assert res.label(1) == "2023-W52" and res.label(2) == "2024-W01"
 
 
+def test_extended_labels_match_spark_axis(spark):
+    """The python-side derived labels (used for projected future periods) must
+    agree with the Spark-built dense map on every OBSERVED period, or the
+    projected region of a chart would be mislabelled."""
+    from parfitt_trb.periods import extended_period_label
+    rows = [
+        row("a", "2023-12-26", True, True, 1),    # 2023-W52
+        row("c", "2023-12-26", False, True, 1),
+        row("a", "2024-01-02", True, True, 1),    # 2024-W01
+        row("c", "2024-01-10", False, True, 1),   # 2024-W02
+    ]
+    for unit in ("iso_week", "iso_fortnight", "fiscal_445"):
+        res = run_trb(make_sdf(spark, rows),
+                      TRBConfig(launch_date="2023-12-25", period_unit=unit,
+                                analysis_date="2024-02-01"),
+                      project_penetration=False)
+        for p, spark_label in res.period_labels.items():
+            assert extended_period_label(p, res.origin, unit) == spark_label, \
+                (unit, p, spark_label)
+
+
 def test_iso_week_gap_preserved_out_of_stock(spark):
     """An out-of-stock 2024-W02 (no sales) must keep its slot: the W03 brand
     trier lands on period 3, NOT collapsed onto period 2 (points 2 & 4)."""
@@ -104,6 +125,77 @@ def test_iso_week_buying_index_on_calendar_axis(spark):
                             analysis_date="2024-12-31"))
     labels = [res.label(p) for p, _ in res.buying_index_series]
     assert labels == ["2024-W01", "2024-W03"]
+
+
+# --------------------------------------------------------------------------- #
+# Fortnight axes: derived 14-day buckets and epoch-aligned ISO-week pairs
+# --------------------------------------------------------------------------- #
+def test_fortnight_axis_derived(spark):
+    rows = [
+        row("b1", "2024-01-01", True, True, 1),    # day 0  -> period 1
+        row("c1", "2024-01-14", False, True, 1),   # day 13 -> period 1
+        row("c2", "2024-01-15", False, True, 1),   # day 14 -> period 2
+    ]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2024-01-01", period_unit="fortnight",
+                            analysis_date="2024-03-31"), project_penetration=False)
+    assert res.period_unit == "fortnight"
+    d = dict(res.penetration.series)
+    # period 1: brand b1 over cat {b1, c1} -> 1/2 ; period 2: +c2 -> 1/3
+    assert approx(d[1], 1 / 2) and approx(d[2], 1 / 3)
+    # labels: the ISO week of each bucket's first day
+    assert res.label(1) == "2024-W01" and res.label(2) == "2024-W03"
+
+
+def test_iso_fortnight_axis_crosses_year(spark):
+    """Epoch-aligned pairs may straddle the year boundary: (2023-W52, 2024-W01)
+    is ONE bucket labelled after its first week ('2023-F52'), the next pair
+    (2024-W02, 2024-W03) is '2024-F02'."""
+    rows = [
+        row("a", "2023-12-26", True, True, 1),    # 2023-W52 -> period 1
+        row("c", "2023-12-26", False, True, 1),
+        row("a", "2024-01-02", False, True, 1),   # 2024-W01 -> STILL period 1
+        row("c2", "2024-01-10", False, True, 1),  # 2024-W02 -> period 2
+    ]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2023-12-25", period_unit="iso_fortnight",
+                            analysis_date="2024-02-01"), project_penetration=False)
+    assert res.period_unit == "iso_fortnight"
+    periods = sorted(p for p, *_ in res.share_series)
+    assert periods == [1, 2]
+    assert res.label(1) == "2023-F52" and res.label(2) == "2024-F02"
+    d = dict(res.penetration.series)
+    # period 1: brand a over cat {a, c} -> 1/2 ; period 2: +c2 -> 1/3
+    assert approx(d[1], 1 / 2) and approx(d[2], 1 / 3)
+
+
+def test_iso_fortnight_gap_preserved(spark):
+    """An empty fortnight keeps its calendar slot (no collapsing)."""
+    rows = [
+        row("c1", "2024-01-01", False, True, 1),   # 2024-W01 -> period 1 (2023-F52)
+        row("b1", "2024-01-29", True, True, 1),    # 2024-W05 -> period 3 (F02 empty)
+    ]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2024-01-01", period_unit="iso_fortnight",
+                            analysis_date="2024-03-31"), project_penetration=False)
+    d = dict(res.penetration.series)
+    assert approx(d[2], 0.0) and approx(d[3], 0.5)
+    assert res.label(2) == "2024-F02" and res.label(3) == "2024-F04"
+
+
+def test_fortnight_pipeline_with_smoothing(spark):
+    """End-to-end smoke: a fortnightly axis with fit-side smoothing enabled."""
+    cat_dates = ["2024-01-03", "2024-01-20", "2024-02-05", "2024-02-19",
+                 "2024-03-04", "2024-03-18", "2024-04-02", "2024-04-16"]
+    rows = [row("b1", "2024-01-02", True, True, 1)]
+    rows += [row(f"c{i}", d, False, True, 1) for i, d in enumerate(cat_dates)]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2024-01-01", period_unit="fortnight",
+                            penetration_smoothing_window=3,
+                            analysis_date="2024-06-30"))
+    assert res.period_unit == "fortnight"
+    assert res.penetration.series                      # built and (maybe) fitted
+    assert res.penetration.series == sorted(res.penetration.series)
 
 
 # --------------------------------------------------------------------------- #

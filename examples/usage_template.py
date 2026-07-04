@@ -30,7 +30,10 @@ try:
 except Exception:
     pass
 
-from parfitt_trb import TRBConfig, penetration_vs_actual, pwsd, run_trb
+from parfitt_trb import (
+    TRBConfig, penetration_stability, penetration_vs_actual, pwsd, run_trb,
+    validate_penetration,
+)
 from parfitt_trb import plots
 from parfitt_trb.display import rollup_ratio
 from parfitt_trb.local_spark import build_local_spark
@@ -43,7 +46,7 @@ os.makedirs(OUT, exist_ok=True)
 def main():
     # --- 0. Data -----------------------------------------------------------
     # Here: a simulated launch with a price promotion at week 18. In production,
-    # replace this with your transaction DataFrame (and backend="spark").
+    # replace this with your transaction DataFrame.
     PROMO_WEEK = 18
     pdf = simulate_panel(n_households=6000, weeks=40, K=0.24, a=0.22,
                          rbr_start=0.42, rbr_stable=0.24, cat_interval=2, seed=11,
@@ -90,6 +93,28 @@ def main():
               f"-> re-fit K={promo.refit_K*100:.1f}% "
               f"(bought ~ {promo.bought_penetration*100:+.1f}pp of penetration)")
 
+    # composed promo-aware curve: each segment re-anchored on the observed
+    # penetration at its promo (the 'true' theoretical curve).
+    pw = res.piecewise_penetration([PROMO_WEEK])
+    if pw.ultimate_penetration is not None:
+        print(f"   piecewise (promo-aware) ultimate K = {pw.ultimate_penetration*100:.1f}%")
+    if pw.note:
+        print(f"   note: {pw.note}")
+
+    # out-of-sample validation: fit up to week 30 only, project, and score the
+    # whole curve (old + predicted weeks) against the full observed series.
+    val = validate_penetration(pen, cutoff_period=30, promo_periods=[PROMO_WEEK])
+    if val.pwsd_full is not None:
+        print(f"   validation @wk30: pwsd full = {val.pwsd_full*100:.2f}%  "
+              f"held-out only = {val.pwsd_holdout*100:.2f}%")
+    if val.note:
+        print(f"   note: {val.note}")
+
+    # does the estimated K stabilise as the estimation window grows?
+    print("\n   K / a stability vs estimation cutoff (last 5 windows):")
+    print(penetration_stability(pen).tail(5).to_string(index=False, formatters={
+        "K": "{:.3f}".format, "a": "{:.3f}".format, "observed_P": "{:.3f}".format}))
+
     # --- 3. Repeat-buying rate by interval and by cohort -------------------
     print("\n3. REPEAT-BUYING RATE")
     ur = res.ultimate_rbr()
@@ -98,6 +123,11 @@ def main():
     plat = res.detect_plateau()
     if plat:
         print(f"   (diagnostic) levels off near {plat[1]*100:.1f}% from interval {plat[0]}")
+        # stabilised mean: set rbr_stable_from in TRBConfig to make this the
+        # share default; here we just show the diagnostic value.
+        st = res.stable_rbr(from_interval=plat[0])
+        if st is not None:
+            print(f"   stabilised mean RBR (from interval {plat[0]}) = {st*100:.1f}%")
     print("\n   By entry cohort (segmented / Table 2 model):")
     print(res.cohort_table().to_string(index=False, formatters={
         "penetration": "{:.3f}".format,
@@ -122,6 +152,16 @@ def main():
     fig.savefig(os.path.join(OUT, "usage_template_dashboard.png"), dpi=110)
     plt.close(fig)
     print("wrote figures/usage_template_dashboard.png")
+
+    # --- Diagnostics figure: promo piecewise / ΔP vs P / cohort RBR ---------
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    plots.plot_penetration_piecewise(res, [PROMO_WEEK], ax=axes[0], pw=pw)
+    plots.plot_dp_vs_p(pen, ax=axes[1], promo_periods=[PROMO_WEEK])
+    plots.plot_rbr_cohorts(res, ax=axes[2])
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "usage_template_diagnostics.png"), dpi=110)
+    plt.close(fig)
+    print("wrote figures/usage_template_diagnostics.png")
     spark.stop()
 
 

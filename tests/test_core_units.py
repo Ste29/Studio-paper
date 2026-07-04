@@ -111,7 +111,9 @@ def test_plotting_smoke(spark):
         row("claire", "2024-08-14", False, True, 15),
     ]), TRBConfig(period_length_days=30, analysis_date="2024-09-30"))
 
+    assert res.rbr_cohort_series               # per-cohort curves exposed
     plots.plot_rbr(res)
+    plots.plot_rbr_cohorts(res)
     plots.plot_share_bars(res)
     plots.plot_share_over_time(res)
     plots.plot_predicted_share(res)
@@ -119,6 +121,10 @@ def test_plotting_smoke(spark):
         plots.plot_penetration(res)
     except ValueError:
         pass
+    try:
+        plots.plot_dp_vs_p(res.penetration)
+    except ValueError:
+        pass                                   # too few periods on this tiny panel
     plots.plot_dashboard(res)
     import matplotlib.pyplot as plt
     plt.close("all")

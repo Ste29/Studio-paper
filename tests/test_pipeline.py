@@ -196,3 +196,34 @@ def test_buying_index_series_present(spark):
     res = run_trb(make_sdf(spark, buying_rows()), TRBConfig(analysis_date="2023-12-31"))
     assert len(res.buying_index_series) >= 1
     assert all(b is None or b > 0 for _, b in res.buying_index_series)
+
+
+def test_buying_series_trier_flag_starts_at_trial(spark):
+    """A card is a trier only from its trial date on: its earlier category
+    purchases must not enter the per-period trier scope (sel_n)."""
+    rows = [
+        row("t1", "2023-01-03", False, True, 10),   # week 1: category only (pre-trial)
+        row("t1", "2023-02-01", True, True, 5),     # week 5: brand trial
+        row("a1", "2023-01-03", False, True, 8),    # never-trier, keeps all_n > 0
+        row("a1", "2023-02-01", False, True, 8),
+    ]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2023-01-01", analysis_date="2023-03-31"),
+                  project_penetration=False)
+    bidx = dict(res.buying_index_series)
+    assert bidx[1] is None, bidx          # t1 not yet a trier in week 1
+    assert bidx[5] is not None            # counted from its trial week on
+
+
+def test_buying_scopes_exclude_prelaunch_volume(spark):
+    """Category volume before the launch origin must not dilute the buying index."""
+    rows = [
+        row("p1", "2023-01-15", False, True, 100),  # pre-launch category volume only
+        row("t1", "2023-06-05", True, True, 20),    # trier: cat vol 50 post-launch
+        row("t1", "2023-06-20", False, True, 30),
+        row("n1", "2023-06-10", False, True, 25),   # category-only buyer
+    ]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2023-06-01", analysis_date="2023-12-31"))
+    # triers avg 50 / all-buyers avg (50+25)/2 -- p1 excluded entirely
+    assert approx(res.buying_index, 50.0 / 37.5), res.buying_index

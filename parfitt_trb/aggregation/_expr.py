@@ -27,6 +27,8 @@ def _period_col(F, ts_col, cfg: TRBConfig, origin_iso: str, origin_month: int,
     origin = F.lit(origin_iso).cast("date")
     if cfg.period_unit == "week":
         return F.floor(F.datediff(ts_col, origin) / 7) + 1
+    if cfg.period_unit == "fortnight":
+        return F.floor(F.datediff(ts_col, origin) / 14) + 1
     # month: (year*12 + month - 1) - origin_month + 1
     return (F.year(ts_col) * 12 + F.month(ts_col) - 1) - F.lit(origin_month) + 1
 

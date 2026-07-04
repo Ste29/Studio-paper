@@ -11,8 +11,8 @@ from typing import Optional, Tuple
 # Canonical calendar-axis unit sets (single source of truth, shared with the
 # aggregation layer). DERIVED units are origin-relative date arithmetic;
 # CALENDAR (anchored) units live on the real calendar grid via a date dimension.
-DERIVED_UNITS = ("week", "month")
-CALENDAR_UNITS = ("iso_week", "fiscal_445")
+DERIVED_UNITS = ("week", "fortnight", "month")
+CALENDAR_UNITS = ("iso_week", "iso_fortnight", "fiscal_445")
 PERIOD_UNITS = DERIVED_UNITS + CALENDAR_UNITS
 
 
@@ -30,14 +30,20 @@ class TRBConfig:
     # and entry COHORTS are always weekly (Parfitt Table 2); this only sets the
     # axis the penetration curve, the realised-share series and the per-period
     # buying index are computed and displayed on.
-    #   'week'  / 'month'      : derived by date arithmetic from the launch origin
-    #                            (origin-relative 7-day / calendar-month buckets).
+    #   'week' / 'fortnight' / 'month' : derived by date arithmetic from the launch
+    #                            origin (origin-relative 7-day / 14-day /
+    #                            calendar-month buckets).
     #   'iso_week'             : ISO calendar weeks ('YYYY-Www', cross-year safe).
+    #   'iso_fortnight'        : pairs of consecutive ISO weeks on a fixed
+    #                            epoch-aligned grid (each bucket exactly 14 days; a
+    #                            pair may straddle a year boundary). Labelled
+    #                            'YYYY-Fww' after the pair's FIRST ISO week.
     #   'fiscal_445'           : retail 4-4-5 periods ('YYYY-Pnn').
-    # The 'iso_week'/'fiscal_445' axes live on the real calendar grid (built from a
-    # date dimension), so a bucket with no sales (e.g. an out-of-stock week) keeps
-    # its slot instead of collapsing onto its neighbour.
-    period_unit: str = "week"              # 'week' | 'month' | 'iso_week' | 'fiscal_445'
+    # The calendar-anchored axes (iso_week / iso_fortnight / fiscal_445) live on the
+    # real calendar grid (built from a date dimension), so a bucket with no sales
+    # (e.g. an out-of-stock week) keeps its slot instead of collapsing onto its
+    # neighbour.
+    period_unit: str = "week"              # one of PERIOD_UNITS
 
     # --- share axis (optional override) ------------------------------------- #
     # When set, the REALISED SHARE series uses a different calendar axis from the
@@ -56,12 +62,21 @@ class TRBConfig:
     penetration_method: str = "discounted"     # 'discounted' (Gilchrist) | 'ols'
     discount_weight: float = 0.6               # Gilchrist lambda (paper uses 0.6)
     penetration_denominator: str = "dynamic"   # 'dynamic' (cum. F) | 'static' (F_tot)
+    # Centred moving-average window applied to a COPY of the observed penetration
+    # before the K/a fit differences it (noise in P is amplified by the centred
+    # differencing). The stored/plotted series and pwsd comparisons stay raw.
+    # None = no smoothing; otherwise an odd integer >= 3.
+    penetration_smoothing_window: Optional[int] = None
 
     # --- repeat-buying rate (RBR) ------------------------------------------ #
     rbr_interval_mode: str = "exact"       # 'exact' (P-day windows) | 'bucket'
     period_length_days: int = 28           # length s of one RBR interval (exact mode)
     rbr_bucket_unit: str = "week"          # 'week' | 'month' (bucket mode)
     max_interval: Optional[int] = None     # cap on interval t (default = max feasible)
+    # Interval from which the analyst judges the RBR curve stabilised. When set,
+    # the share estimates use the MEAN of the observed RBR from this interval on
+    # instead of the furthest-available value. None = furthest-available (paper).
+    rbr_stable_from: Optional[int] = None
 
     # --- buying-rate index -------------------------------------------------- #
     buying_index_base: str = "triers"      # 'triers' (Parfitt) | 'repeaters' (Charan)
@@ -94,5 +109,11 @@ class TRBConfig:
             raise ValueError("rbr_bucket_unit must be 'week' or 'month'")
         if self.buying_index_base not in ("triers", "repeaters"):
             raise ValueError("buying_index_base must be 'triers' or 'repeaters'")
+        if self.rbr_stable_from is not None and self.rbr_stable_from < 1:
+            raise ValueError("rbr_stable_from must be >= 1 (an RBR interval)")
+        w = self.penetration_smoothing_window
+        if w is not None and (w < 3 or w % 2 == 0):
+            raise ValueError("penetration_smoothing_window must be an odd int >= 3 "
+                             "(a centred window needs symmetric arms)")
         if tuple(self.cohort_boundaries_weeks) != tuple(sorted(set(self.cohort_boundaries_weeks))):
             raise ValueError("cohort_boundaries_weeks must be strictly increasing & unique")

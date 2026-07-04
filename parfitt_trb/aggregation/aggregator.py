@@ -242,7 +242,11 @@ class SparkAggregator:
     # -- buying index ------------------------------------------------------- #
     def buying_scopes(self) -> pd.DataFrame:
         F, c = self._F, self.cfg
-        cat = self._p.filter(F.col("is_cat"))
+        # Category volume is always scoped to on/after the launch origin (pre-launch
+        # history must not dilute the buying index); the optional rolling window
+        # narrows it further.
+        cat = self._p.filter(F.col("is_cat")
+                             & (F.col("ts") >= F.lit(self._origin).cast("date")))
         if c.buying_index_window_days is not None:
             start = (pd.Timestamp(self.analysis_date)
                      - pd.Timedelta(days=c.buying_index_window_days)).date()
@@ -277,12 +281,17 @@ class SparkAggregator:
 
     def buying_series(self) -> pd.DataFrame:
         F = self._F
-        triers = self._trials.select("card").distinct().withColumn("_is_trier", F.lit(True))
+        triers = self._trials.select("card", "trial_ts")   # one row per card
         # Single group-by over the category lines: the all-buyer and trier-only
-        # sums/distinct-counts come out of one shuffle on `period`.
+        # sums/distinct-counts come out of one shuffle on `period`. A card only
+        # counts as a trier from its trial date onward -- its earlier category
+        # purchases stay in the all-buyer scope only.
         cat = (self._p.filter(F.col("is_cat") & (F.col("ts") >= F.lit(self._origin).cast("date")))
                .withColumn("period", self._main_period_col())
-               .join(triers, "card", "left"))
+               .join(triers, "card", "left")
+               .withColumn("_is_trier",
+                           F.col("trial_ts").isNotNull()
+                           & (F.col("ts") >= F.col("trial_ts"))))
         out = (cat.groupBy("period").agg(
                    F.sum("qty").alias("all_sum"),
                    F.countDistinct("card").alias("all_n"),

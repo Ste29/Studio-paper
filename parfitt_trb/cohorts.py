@@ -1,4 +1,4 @@
-"""Entry-cohort labelling (Table 2). Pure logic, shared by both backends.
+"""Entry-cohort labelling (Table 2). Pure, engine-free logic.
 
 A cohort is defined by how many weeks after launch a shopper first tried the
 brand. Boundaries ``(6, 12, 24)`` yield ``1-6w / 7-12w / 13-24w / 25+w`` -- the

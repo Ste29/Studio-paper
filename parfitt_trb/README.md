@@ -63,13 +63,16 @@ The brand is part of the category (`treat_brand_as_category=True` ORs it in).
 | Quantity | How | Faithful to |
 |---|---|---|
 | **Trial / penetration** `P(t)=ΣN/ΣF` | cumulative brand triers / category triers, weekly | appendix |
-| **Ultimate penetration `K`** | fit `ΔP(t)=a(K−P(t))` (centred diff) by **discounted least squares** (Gilchrist, w=0.6) → `P(t)=K(1−e^{−at})` | appendix, Fig 18 |
+| **Ultimate penetration `K`** | fit `ΔP(t)=a(K−P(t))` (centred diff) by **discounted least squares** (Gilchrist, w=0.6) → `P(t)=K(1−e^{−at})`; optional fit-side centred smoothing of P (`penetration_smoothing_window` — the stored/plotted series stays raw) | appendix, Fig 18 |
 | **RBR `R(t,s)`** | pooled brand/category volume over rolling intervals anchored to each shopper's trial, lapsed buyers kept, **furthest available interval** taken (r→∞ proxy) | §RBR, Table 1 |
 | **Buying index `B`** | avg category volume of brand buyers / of all category buyers, on the analysis window; **base = triers** by default (`repeaters` optional) | Fig 17 |
 | **Share (simple)** | `K × R(last) × B` | p.133, Fig 17 |
 | **Share (segmented)** | `Σ Pᵢ × Rᵢ × Bᵢ` over entry cohorts + estimated future cohort | **Table 2** |
 | **p.w.s.d.** | weighted RMS relative penetration-forecast error (w=0.6) | appendix, Fig 19 |
 | **Promotion effect** | baseline fit before a cutoff vs realised vs re-fit after → "bought" penetration | Fig 12–15 |
+| **Piecewise promo curve** | `fit_piecewise_penetration` — one `K(1−e^{−at})` segment per promo, each re-anchored on the observed penetration at its promo (change of coordinates); the composed "true" theoretical curve, also used by validation | Fig 12–15 (extended) |
+| **Out-of-sample validation** | `validate_penetration` — fit up to a cutoff, project the held-out weeks (promo-aware), score p.w.s.d. of the whole curve vs the full observed series | appendix |
+| **K stability diagnostic** | `penetration_stability` — K, a, observed P per estimation cutoff, to see whether K settles | appendix |
 
 ### Key modelling decisions (and where they diverge)
 
@@ -80,11 +83,15 @@ The brand is part of the category (`treat_brand_as_category=True` ORs it in).
 - **Share uses the *projected* `K`** (`predict_share_projected`), faithful to the
   appendix. `predict_share(rbr)` is the simple `trial × rbr × buying` multiplier
   used in the paper's worked example (34%×25%×1.00=8.5%).
-- **No automatic RBR-stability detection** (your call): the share takes the last
-  available interval; `detect_plateau()` is a *diagnostic* only, and the RBR plot
-  shows whether it had really levelled off. If the last interval is a thin tail,
-  pass an explicit value: `res.predict_share_projected(rbr_value=...)`, or cap it
-  with `TRBConfig(max_interval=...)`.
+- **RBR-stability is the analyst's call.** By default the share takes the
+  furthest-available interval; `detect_plateau()` is a *diagnostic* only, and the
+  RBR plot (pooled and, via `plot_rbr_cohorts`, per cohort) shows whether it had
+  really levelled off. Once you judge it stable from some interval, set
+  `TRBConfig(rbr_stable_from=t)` — the simple and segmented shares then use the
+  **mean** RBR from `t` on (young cohorts with no points there fall back to their
+  furthest-available rate). You can still pass an explicit
+  `res.predict_share_projected(rbr_value=...)` or cap with
+  `TRBConfig(max_interval=...)`.
 - **Cohort share is a sum of contributions, not of RBRs.** `Σ Pᵢ Rᵢ Bᵢ`; the
   single "blended" RBR reported (`blended_rbr`) is the penetration-weighted
   average, never a sum.
@@ -126,22 +133,33 @@ plots.plot_dashboard(res)       # penetration | RBR | predicted share
 `TRBConfig` reference: see `config.py` (penetration_method, discount_weight,
 penetration_denominator, rbr_interval_mode, rbr_bucket_unit, buying_index_base,
 repeater_min_purchases, buying_index_window_days, cohort_boundaries_weeks,
-include_prelaunch_cohort, max_interval).
+include_prelaunch_cohort, max_interval, rbr_stable_from).
+
+Diagnostics beyond the dashboard: `plots.plot_rbr_cohorts(res)` (per-cohort RBR
+curves, to choose the cohort count), `plots.plot_dp_vs_p(pen, promo_periods=...)`
+(the `ΔP=a(K−P)` difference model with a fitted line per promo segment), and
+`plots.plot_penetration_piecewise(res, promo_periods)` (observed vs the composed
+promo-aware curve, with the "bought" boost shaded).
 
 ### Calendar granularity (penetration / share / per-period buying index)
 
 By default these calendar-time series are computed and labelled on **weekly**
 periods. Two knobs change that (RBR has its own axis; entry cohorts stay weekly):
 
-- `period_unit="week"` (default) / `"month"` — origin-relative 7-day / calendar
-  month buckets, derived by date arithmetic. `"week"` labels each period with its
-  ISO week (`YYYY-Www`); `"month"` with `YYYY-MM`.
-- `period_unit="iso_week"` / `"fiscal_445"` — **calendar-anchored** axes built
-  from a date dimension over `[origin, analysis]`. `iso_week` uses ISO calendar
-  weeks (`YYYY-Www`, handling `2023-W52 → 2024-W01` and 53-week years);
-  `fiscal_445` uses retail 4-4-5 periods (`YYYY-Pnn`). Because they live on the
-  real calendar grid, a bucket with **no sales** (e.g. an out-of-stock week)
-  keeps its slot instead of collapsing onto its neighbour.
+- `period_unit="week"` (default) / `"fortnight"` / `"month"` — origin-relative
+  7-day / 14-day / calendar month buckets, derived by date arithmetic. `"week"`
+  and `"fortnight"` label each period with the ISO week of its first day
+  (`YYYY-Www`); `"month"` with `YYYY-MM`.
+- `period_unit="iso_week"` / `"iso_fortnight"` / `"fiscal_445"` —
+  **calendar-anchored** axes built from a date dimension over `[origin,
+  analysis]`. `iso_week` uses ISO calendar weeks (`YYYY-Www`, handling
+  `2023-W52 → 2024-W01` and 53-week years); `iso_fortnight` pairs consecutive
+  ISO weeks on a fixed epoch-aligned grid (every bucket exactly 14 days; a pair
+  may straddle a year boundary) and labels each pair after its **first** week
+  (`YYYY-Fww`: `2023-F52` covers 2023-W52 + 2024-W01, the next pair is
+  `2024-F02`); `fiscal_445` uses retail 4-4-5 periods (`YYYY-Pnn`). Because they
+  live on the real calendar grid, a bucket with **no sales** (e.g. an
+  out-of-stock week) keeps its slot instead of collapsing onto its neighbour.
 - `share_period_unit` (optional) puts the realised-share series on a *different*
   axis from penetration (e.g. penetration on `iso_week`, share on `month`).
 
