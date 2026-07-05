@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import pytest
 
 from parfitt_trb import TRBConfig, TRBResult, run_trb
+from parfitt_trb.aggregation import SparkAggregator
 from tests.helpers import approx, make_sdf, row
 
 
@@ -198,21 +199,47 @@ def test_buying_index_series_present(spark):
     assert all(b is None or b > 0 for _, b in res.buying_index_series)
 
 
-def test_buying_series_trier_flag_starts_at_trial(spark):
-    """A card is a trier only from its trial date on: its earlier category
-    purchases must not enter the per-period trier scope (sel_n)."""
+def test_buying_series_fixed_panel(spark):
+    """Fixed-panel series (deliberate design): the trier base is the whole
+    dataset's triers in EVERY period -- week 1 counts the category volume of a
+    card that only trials in week 5 -- and the per-capita denominators are the
+    constant base sizes (a member skipping a period weighs 0)."""
     rows = [
-        row("t1", "2023-01-03", False, True, 10),   # week 1: category only (pre-trial)
+        row("t1", "2023-01-03", False, True, 10),   # week 1: category (pre-trial)
         row("t1", "2023-02-01", True, True, 5),     # week 5: brand trial
-        row("a1", "2023-01-03", False, True, 8),    # never-trier, keeps all_n > 0
+        row("a1", "2023-01-03", False, True, 8),    # never-trier
         row("a1", "2023-02-01", False, True, 8),
     ]
-    res = run_trb(make_sdf(spark, rows),
-                  TRBConfig(launch_date="2023-01-01", analysis_date="2023-03-31"),
-                  project_penetration=False)
+    cfg = TRBConfig(launch_date="2023-01-01", analysis_date="2023-03-31")
+    res = run_trb(make_sdf(spark, rows), cfg, project_penetration=False)
     bidx = dict(res.buying_index_series)
-    assert bidx[1] is None, bidx          # t1 not yet a trier in week 1
-    assert bidx[5] is not None            # counted from its trial week on
+    # bases: 1 trier (t1), 2 category triers (t1, a1) -- constant in every period
+    assert approx(bidx[1], (10.0 / 1) / (18.0 / 2)), bidx   # pre-trial volume counts
+    assert approx(bidx[5], (5.0 / 1) / (13.0 / 2)), bidx
+
+    agg = SparkAggregator(make_sdf(spark, rows), cfg)
+    bs = agg.buying_series()
+    assert bs["sel_n"].nunique() == 1 and int(bs["sel_n"].iloc[0]) == 1
+    assert bs["all_n"].nunique() == 1 and int(bs["all_n"].iloc[0]) == 2
+    agg.close()
+
+
+def test_buying_index_window_keeps_dormant_triers_in_base(spark):
+    """With a window, the volume is window-scoped but the bases stay all-time:
+    a trier dormant in the window weighs 0 instead of dropping out."""
+    rows = [
+        row("d1", "2023-06-05", True, True, 10),    # trier, dormant in the window
+        row("t1", "2023-06-10", True, True, 20),    # trier, active in the window
+        row("t1", "2023-11-20", False, True, 30),
+        row("n1", "2023-11-25", False, True, 25),   # category-only buyer
+    ]
+    res = run_trb(make_sdf(spark, rows),
+                  TRBConfig(launch_date="2023-06-01", analysis_date="2023-12-31",
+                            buying_index_window_days=60),
+                  project_penetration=False)
+    # window > 2023-11-01: trier volume 30 over base 2; all volume 55 over the
+    # 3 category triers (d1's June brand line makes it a category trier too)
+    assert approx(res.buying_index, (30.0 / 2) / (55.0 / 3)), res.buying_index
 
 
 def test_buying_scopes_exclude_prelaunch_volume(spark):

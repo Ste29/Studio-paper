@@ -65,7 +65,7 @@ The brand is part of the category (`treat_brand_as_category=True` ORs it in).
 | **Trial / penetration** `P(t)=ΣN/ΣF` | cumulative brand triers / category triers, weekly | appendix |
 | **Ultimate penetration `K`** | fit `ΔP(t)=a(K−P(t))` (centred diff) by **discounted least squares** (Gilchrist, w=0.6) → `P(t)=K(1−e^{−at})`; optional fit-side centred smoothing of P (`penetration_smoothing_window` — the stored/plotted series stays raw) | appendix, Fig 18 |
 | **RBR `R(t,s)`** | pooled brand/category volume over rolling intervals anchored to each shopper's trial, lapsed buyers kept, **furthest available interval** taken (r→∞ proxy) | §RBR, Table 1 |
-| **Buying index `B`** | avg category volume of brand buyers / of all category buyers, on the analysis window; **base = triers** by default (`repeaters` optional) | Fig 17 |
+| **Buying index `B`** | fixed-base per-capita category volume: window volume of ALL brand triers / their total count, over the same for ALL category triers (dormant members weigh 0; the window narrows the volume, never the base); **base = triers** by default (`repeaters` optional) | Fig 17 |
 | **Share (simple)** | `K × R(last) × B` | p.133, Fig 17 |
 | **Share (segmented)** | `Σ Pᵢ × Rᵢ × Bᵢ` over entry cohorts + estimated future cohort | **Table 2** |
 | **p.w.s.d.** | weighted RMS relative penetration-forecast error (w=0.6) | appendix, Fig 19 |

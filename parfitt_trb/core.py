@@ -574,10 +574,12 @@ def rbr_cohort_series(rbr_cohort: pd.DataFrame, cohort_order: Sequence[str]
 # Buying-rate index
 # --------------------------------------------------------------------------- #
 def buying_index_from_scopes(scopes: pd.DataFrame, scope: str) -> Optional[float]:
-    """avg category volume of `scope` buyers / avg of all category buyers.
+    """avg category volume per `scope` member / avg per category trier.
 
     `scopes` has columns scope, sum_cat, n_buyers; the all-category row is
-    keyed '__all__'. Returns None when the scope has no buyers in the window.
+    keyed '__all__'. Fixed-base averages: n_buyers is the scope's full
+    membership, so members with no window purchases weigh 0. Returns None when
+    the scope has no members at all.
     """
     rows = {r.scope: (float(r.sum_cat), int(r.n_buyers))
             for r in scopes.itertuples(index=False)}
@@ -591,8 +593,9 @@ def buying_index_from_scopes(scopes: pd.DataFrame, scope: str) -> Optional[float
 
 
 def buying_index_series(buying_series: pd.DataFrame) -> List[Tuple[int, Optional[float]]]:
-    """Per-period diagnostic buying index. Columns:
-    period, sel_sum, sel_n, all_sum, all_n. (point 1: each period its own B)."""
+    """Per-period diagnostic buying index on a FIXED panel. Columns:
+    period, sel_sum, sel_n, all_sum, all_n -- the n columns are the constant
+    all-time base sizes (each period its own B; skipping members weigh 0)."""
     out: List[Tuple[int, Optional[float]]] = []
     for r in buying_series.sort_values("period").itertuples(index=False):
         if r.sel_n and r.all_n and r.all_sum > 0:
