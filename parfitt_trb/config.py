@@ -81,6 +81,9 @@ class TRBConfig:
     # --- buying-rate index -------------------------------------------------- #
     buying_index_base: str = "triers"      # 'triers' (Parfitt) | 'repeaters' (Charan)
     repeater_min_purchases: int = 2        # >= this many brand buys => repeater
+    # The window narrows the VOLUME being compared, never the membership bases:
+    # scope members (triers / repeaters / category triers) stay all-time, and a
+    # member with no purchases in the window weighs 0 in the per-capita average.
     buying_index_window_days: Optional[int] = None  # None = all history up to analysis
 
     # --- entry cohorts (Table 2) ------------------------------------------- #

@@ -10,8 +10,10 @@ Contract (all small pandas DataFrames):
   entrants()    : period, n_brand_new, n_cat_new
   rbr_pooled()  : interval, brand_qty, cat_qty, n_eligible
   rbr_cohort()  : cohort, interval, brand_qty, cat_qty
-  buying_scopes(): scope, sum_cat, n_buyers          (scope '__all__' = everyone)
-  buying_series(): period, sel_sum, sel_n, all_sum, all_n
+  buying_scopes(): scope, sum_cat, n_buyers   ('__all__' = everyone; n_buyers is
+                   the scope's FULL membership, not the window-active buyers)
+  buying_series(): period, sel_sum, sel_n, all_sum, all_n   (fixed panel: the
+                   n columns are the constant all-time base sizes)
   share_long()  : period, brand_qty, cat_qty
   cohort_counts(): {cohort label -> n triers}
 plus the calendar-label maps period_labels() / share_period_labels().
@@ -241,6 +243,11 @@ class SparkAggregator:
 
     # -- buying index ------------------------------------------------------- #
     def buying_scopes(self) -> pd.DataFrame:
+        """Fixed-base scopes: ``sum_cat`` is the category volume inside the
+        (optional) window, but ``n_buyers`` is the scope's FULL all-time
+        membership -- a member with no purchases in the window weighs 0 in the
+        per-capita average instead of dropping out. The window narrows the
+        volume, never the base."""
         F, c = self._F, self.cfg
         # Category volume is always scoped to on/after the launch origin (pre-launch
         # history must not dilute the buying index); the optional rolling window
@@ -251,55 +258,57 @@ class SparkAggregator:
             start = (pd.Timestamp(self.analysis_date)
                      - pd.Timedelta(days=c.buying_index_window_days)).date()
             cat = cat.filter(F.col("ts") > F.lit(start.isoformat()).cast("date"))
-        cbc = cat.groupBy("card").agg(F.sum("qty").alias("v"))   # per-card category volume
+        cbc = cat.groupBy("card").agg(F.sum("qty").alias("v"))   # per-card window volume
         brand_counts = self._p.filter(F.col("is_brand")).groupBy("card").count()
         is_rep = F.coalesce(F.col("count"), F.lit(0)) >= c.repeater_min_purchases
-        # One per-card-collapse pass: group category buyers by entry cohort
-        # (null = non-trier) and carry the repeater-only sums alongside, so every
-        # scope below is read off one tiny collected result.
+        # Window sums per entry cohort (null = non-trier), with the repeater-only
+        # sums alongside; the member counts come from the membership tables, not
+        # from who happened to buy in the window.
         rows = (cbc.join(self._trials.select("card", "cohort"), "card", "left")
                 .join(brand_counts, "card", "left")
                 .groupBy("cohort")
-                .agg(F.sum("v").alias("s"), F.count("v").alias("n"),
-                     F.sum(F.when(is_rep, F.col("v"))).alias("rs"),
-                     F.count(F.when(is_rep, F.col("v"))).alias("rn"))
+                .agg(F.sum("v").alias("s"),
+                     F.sum(F.when(is_rep, F.col("v"))).alias("rs"))
                 .collect())
-        by_cohort = {r["cohort"]: (float(r["s"]), int(r["n"]))
-                     for r in rows if r["cohort"] is not None}
-        triers = [r for r in rows if r["cohort"] is not None]
+        sums = {r["cohort"]: float(r["s"] or 0.0) for r in rows}
+        counts = self.cohort_counts()                      # {cohort: total triers}
+        n_rep = int(brand_counts
+                    .filter(F.col("count") >= c.repeater_min_purchases).count())
         scopes = [
-            ("__all__", float(sum(r["s"] or 0.0 for r in rows)),
-             int(sum(r["n"] or 0 for r in rows))),
-            ("__triers__", float(sum(r["s"] or 0.0 for r in triers)),
-             int(sum(r["n"] or 0 for r in triers))),
-            ("__repeaters__", float(sum(r["rs"] or 0.0 for r in rows)),
-             int(sum(r["rn"] or 0 for r in rows))),
+            ("__all__", float(sum(sums.values())), int(self.n_category_triers)),
+            ("__triers__",
+             float(sum(v for k, v in sums.items() if k is not None)),
+             int(sum(counts.values()))),
+            ("__repeaters__",
+             float(sum(float(r["rs"] or 0.0) for r in rows)), n_rep),
         ]
         for label in cohort_order(c.cohort_boundaries_weeks, c.include_prelaunch_cohort):
-            scopes.append((label, *by_cohort.get(label, (0.0, 0))))
+            scopes.append((label, sums.get(label, 0.0), int(counts.get(label, 0))))
         return pd.DataFrame(scopes, columns=["scope", "sum_cat", "n_buyers"])
 
     def buying_series(self) -> pd.DataFrame:
+        """Fixed-panel per-period diagnostic (deliberate design): the trier base
+        is the WHOLE dataset's triers in every period -- early periods include
+        category volume bought by shoppers who only trial later -- and ``sel_n``
+        / ``all_n`` are the constant base sizes, so a member who skips a period
+        weighs 0 in that period's per-capita average."""
         F = self._F
-        triers = self._trials.select("card", "trial_ts")   # one row per card
+        triers = (self._trials.select("card").distinct()
+                  .withColumn("_is_trier", F.lit(True)))
         # Single group-by over the category lines: the all-buyer and trier-only
-        # sums/distinct-counts come out of one shuffle on `period`. A card only
-        # counts as a trier from its trial date onward -- its earlier category
-        # purchases stay in the all-buyer scope only.
+        # sums come out of one shuffle on `period`; the constant denominators
+        # are attached afterwards from the membership tables.
         cat = (self._p.filter(F.col("is_cat") & (F.col("ts") >= F.lit(self._origin).cast("date")))
                .withColumn("period", self._main_period_col())
-               .join(triers, "card", "left")
-               .withColumn("_is_trier",
-                           F.col("trial_ts").isNotNull()
-                           & (F.col("ts") >= F.col("trial_ts"))))
+               .join(triers, "card", "left"))
         out = (cat.groupBy("period").agg(
                    F.sum("qty").alias("all_sum"),
-                   F.countDistinct("card").alias("all_n"),
-                   F.sum(F.when(F.col("_is_trier"), F.col("qty"))).alias("sel_sum"),
-                   F.countDistinct(F.when(F.col("_is_trier"), F.col("card"))).alias("sel_n"))
+                   F.sum(F.when(F.col("_is_trier"), F.col("qty"))).alias("sel_sum"))
                .toPandas().fillna(0.0).sort_values("period"))
         if out.empty:
             return pd.DataFrame(columns=["period", "sel_sum", "sel_n", "all_sum", "all_n"])
+        out["sel_n"] = int(self._trials.count())
+        out["all_n"] = int(self.n_category_triers)
         return out[["period", "sel_sum", "sel_n", "all_sum", "all_n"]]
 
     # -- realised share ----------------------------------------------------- #
