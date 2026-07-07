@@ -49,6 +49,18 @@ def test_eligibility_inherent(spark):
     assert approx(res.rbr_at(5), 0.15)
 
 
+def test_n_eligible_counts_triers_beyond_the_cap(spark):
+    """With cfg.max_interval below the feasible horizon, n_eligible must still
+    count the triers observable beyond the cap: their intervals <= cap are
+    inside the brand/cat sums (Anita/Betty/Claire reach 9/7/6, Dora 3)."""
+    res = run_trb(make_sdf(spark, rbr_rows()),
+                  TRBConfig(period_length_days=30, analysis_date="2024-09-30",
+                            max_interval=3))
+    by_t = {p.interval: p for p in res.rbr_series}
+    assert sorted(by_t) == [1, 2, 3]
+    assert {t: p.n_eligible for t, p in by_t.items()} == {1: 4, 2: 4, 3: 4}
+
+
 def test_analysis_date_shrinks_cohort(spark):
     """Re-running on 2024-06-30, only Anita has reached interval 5 -> RBR=0.5."""
     res = run_trb(make_sdf(spark, rbr_rows()),

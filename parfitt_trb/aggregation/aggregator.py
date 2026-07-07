@@ -212,10 +212,15 @@ class SparkAggregator:
 
     def _n_eligible(self, upper: int) -> Dict[int, int]:
         """n_eligible(t) = #triers whose max_interval >= t, for t in 1..upper.
-        From the tiny max_interval distribution (one row per distinct value)."""
+        From the tiny max_interval distribution (one row per distinct value).
+        The cumulation is seeded with the triers observable BEYOND `upper`:
+        when cfg.max_interval caps the axis below the feasible horizon, their
+        early intervals are still inside the brand/cat sums, so they belong in
+        every base at t <= upper."""
         dist = {int(r["max_interval"]): int(r["count"]) for r in
                 self._trials.groupBy("max_interval").count().collect()}
-        out, running = {}, 0
+        out = {}
+        running = sum(c for v, c in dist.items() if v > upper)
         for t in range(upper, 0, -1):                       # cumulate from the top
             running += dist.get(t, 0)
             out[t] = running
