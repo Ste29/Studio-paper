@@ -22,7 +22,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .calendar import _check_unit, as_date, period_col, period_label
+from .calendar import (_check_unit, as_date, parse_period_label, period_col,
+                       period_label, period_of)
 
 _DENOMINATORS = ("dynamic", "static")
 
@@ -64,6 +65,21 @@ class PenetrationCurve:
     def snapshot(self) -> float:
         """End-of-window penetration N_tot / F_tot (the observed trial index)."""
         return self.n_brand_triers / self.n_category_triers
+
+    @property
+    def origin_iso_week(self) -> str:
+        """Label of the ISO week containing the launch ('YYYY-Www')."""
+        return period_label(1, self.origin, "iso_week")
+
+    @property
+    def origin_iso_fortnight(self) -> str:
+        """Label of the fortnight containing the launch ('YYYY-Fww')."""
+        return period_label(1, self.origin, "iso_fortnight")
+
+    @property
+    def origin_month(self) -> str:
+        """Label of the month containing the launch ('YYYY-MM')."""
+        return period_label(1, self.origin, "month")
 
     def fitted(self, t: float) -> Optional[float]:
         """Theoretical P(t) = K(1 - e^{-a t}); None when not fitted."""
@@ -229,6 +245,21 @@ def _truncated(curve: PenetrationCurve, cutoff_period: int) -> PenetrationCurve:
 # --------------------------------------------------------------------------- #
 # Piecewise promo-aware composition
 # --------------------------------------------------------------------------- #
+def _resolve_period(p: int | str, origin: date, unit: str) -> int:
+    """Period ordinal from an int (pass-through) or a calendar label
+    ('YYYY-Www' / 'YYYY-Fww' / 'YYYY-MM'), resolved to the bucket containing
+    the label's start day on the origin-anchored axis (so a weekly label lands
+    in its fortnight/month on the wider units)."""
+    return (period_of(parse_period_label(p), origin, unit)
+            if isinstance(p, str) else int(p))
+
+
+def _resolve_promos(promo_periods: Sequence[int | str], origin: date,
+                    unit: str) -> List[int]:
+    """Period ordinals from mixed promo specs (see :func:`_resolve_period`)."""
+    return [_resolve_period(p, origin, unit) for p in promo_periods]
+
+
 @dataclass
 class Segment:
     """One piece of the composed curve: base + K_inc(1 - e^{-a(t - t0)})."""
@@ -295,7 +326,7 @@ class PiecewiseCurve:
         return _observed_fitted_frame(self.series, self.label, self.fitted)
 
 
-def fit_piecewise(curve: PenetrationCurve, promo_periods: Sequence[int], *,
+def fit_piecewise(curve: PenetrationCurve, promo_periods: Sequence[int | str], *,
                   discount_weight: float = 0.6,
                   smoothing_window: Optional[int] = None,
                   min_segment_points: int = 4) -> PiecewiseCurve:
@@ -307,15 +338,22 @@ def fit_piecewise(curve: PenetrationCurve, promo_periods: Sequence[int], *,
     the change of coordinates back gives P_i(t) = P0 + K'(1 - e^{-a'(t - t_i)}),
     so every piece starts exactly where the observed curve stood at its promo.
     An empty `promo_periods` reduces to the plain single fit in one segment.
+
+    Each promo is a period ordinal (int) or a calendar label ('YYYY-Www' /
+    'YYYY-Fww' / 'YYYY-MM'); a weekly label on a fortnight/month axis maps into
+    the bucket containing the week's Monday. On the wider units the anchor base
+    P0 may already include part of the boost when the promo falls mid-bucket
+    (bucket-resolution limit): K_inc is then slightly understated.
     """
     series = list(curve.series)
     if not series:
         raise ValueError("no penetration series to fit")
     obs = dict(series)
-    promos = [int(p) for p in promo_periods]
+    promos = _resolve_promos(promo_periods, curve.origin, curve.unit)
     if promos != sorted(set(promos)):
-        raise ValueError("promo_periods must be strictly increasing")
-    missing = [p for p in promos if p not in obs]
+        raise ValueError("promo_periods must be strictly increasing "
+                         f"(resolved ordinals: {promos})")
+    missing = [f"{p} ({curve.label(p)})" for p in promos if p not in obs]
     if missing:
         raise ValueError(f"promo periods {missing} not in the observed series "
                          "(the observed penetration at each promo anchors its segment)")
@@ -393,28 +431,36 @@ class ValidationResult:
         })
 
 
-def validate(curve: PenetrationCurve, cutoff_period: int, *,
-             promo_periods: Optional[Sequence[int]] = None,
+def validate(curve: PenetrationCurve, cutoff_period: int | str, *,
+             promo_periods: Optional[Sequence[int | str]] = None,
              discount_weight: float = 0.6,
              smoothing_window: Optional[int] = None,
              w: float = 0.6) -> ValidationResult:
     """Fit on data up to `cutoff_period`, project the future periods, and score
     the whole theoretical curve against the full observed series. With
     `promo_periods` the truncated fit is piecewise promo-aware (promos after
-    the cutoff are unknowable at forecast time: dropped and noted)."""
+    the cutoff are unknowable at forecast time: dropped and noted).
+
+    `cutoff_period` is a period ordinal (int) or a calendar label resolved to
+    the bucket CONTAINING it, as in :func:`fit_piecewise` -- so a weekly label
+    picks the right fortnight/month regardless of where the launch week falls
+    in its pair."""
     series = list(curve.series)
-    cutoff = int(cutoff_period)
+    cutoff = _resolve_period(cutoff_period, curve.origin, curve.unit)
     train_pts = [(t, p) for t, p in series if t <= cutoff]
     holdout = [(t, p) for t, p in series if t > cutoff]
     if len(train_pts) < 4:
-        raise ValueError("need >=4 observed periods on/before the cutoff to fit")
+        raise ValueError("need >=4 observed periods on/before the cutoff to fit "
+                         f"(cutoff {cutoff} = {curve.label(cutoff)})")
     if not holdout:
-        raise ValueError("no held-out periods after the cutoff: nothing to validate")
+        raise ValueError("no held-out periods after the cutoff: nothing to "
+                         f"validate (cutoff {cutoff} = {curve.label(cutoff)})")
 
     train = _truncated(curve, cutoff)
     note_parts: List[str] = []
-    pre_promos = [int(p) for p in (promo_periods or []) if int(p) <= cutoff]
-    dropped = [int(p) for p in (promo_periods or []) if int(p) > cutoff]
+    promos = _resolve_promos(promo_periods or [], curve.origin, curve.unit)
+    pre_promos = [p for p in promos if p <= cutoff]
+    dropped = [p for p in promos if p > cutoff]
     if dropped:
         note_parts.append(f"promos after the cutoff dropped from the fit: {dropped}")
     fitted_curve: object
@@ -442,12 +488,14 @@ def validate(curve: PenetrationCurve, cutoff_period: int, *,
                             note="; ".join(note_parts))
 
 
-def stability(curve: PenetrationCurve, *, cutoffs: Optional[Sequence[int]] = None,
+def stability(curve: PenetrationCurve, *,
+              cutoffs: Optional[Sequence[int | str]] = None,
               min_periods: int = 6, discount_weight: float = 0.6,
               smoothing_window: Optional[int] = None) -> pd.DataFrame:
     """One row per estimation cutoff -- cutoff, label, K, a, observed_P, note --
     so the analyst can see whether K stabilises as the window grows. Default
-    cutoffs = every observed period from `min_periods` to the last."""
+    cutoffs = every observed period from `min_periods` to the last; each cutoff
+    is an ordinal (int) or a calendar label, as in :func:`validate`."""
     series = curve.series
     if not series:
         raise ValueError("no penetration series")
@@ -456,15 +504,75 @@ def stability(curve: PenetrationCurve, *, cutoffs: Optional[Sequence[int]] = Non
         cutoffs = [t for t, _ in series if t >= min_periods]
     rows = []
     for c in cutoffs:
-        sub = _truncated(curve, int(c))
+        c = _resolve_period(c, curve.origin, curve.unit)
+        sub = _truncated(curve, c)
         fit(sub, discount_weight=discount_weight, smoothing_window=smoothing_window)
         rows.append({
-            "cutoff": int(c),
-            "label": curve.label(int(c)),
+            "cutoff": c,
+            "label": curve.label(c),
             "K": np.nan if sub.K is None else sub.K,
             "a": np.nan if sub.a is None else sub.a,
-            "observed_P": obs.get(int(c), sub.series[-1][1] if sub.series else np.nan),
+            "observed_P": obs.get(c, sub.series[-1][1] if sub.series else np.nan),
             "note": sub.note,
         })
     return pd.DataFrame(rows, columns=["cutoff", "label", "K", "a",
                                        "observed_P", "note"])
+
+
+def stability_piecewise(curve: PenetrationCurve,
+                        promo_periods: Sequence[int | str], *,
+                        cutoffs: Optional[Sequence[int | str]] = None,
+                        min_periods: int = 6, discount_weight: float = 0.6,
+                        smoothing_window: Optional[int] = None,
+                        min_segment_points: int = 4) -> pd.DataFrame:
+    """K-stability diagnostic for the piecewise promo-aware fit: one row per
+    estimation cutoff -- cutoff, label, K, a, observed_P, n_segments_fitted,
+    note -- so the analyst can see whether the composed ultimate penetration
+    stabilises as the window grows.
+
+    K is the composed curve's ultimate penetration (base + K_inc of the last
+    fitted segment) and `a` that segment's rate. Right after a promo the last
+    segment has too few points to fit: K falls back to the most recent fitted
+    segment's ceiling and `note` flags it -- do not read those rows as
+    stability. Promos after a cutoff are unknowable at that estimation date:
+    dropped from the fit and noted, as in :func:`validate`. Promos and cutoffs
+    are ints (ordinals) or calendar labels, as in :func:`fit_piecewise`.
+    """
+    series = curve.series
+    if not series:
+        raise ValueError("no penetration series")
+    obs = dict(series)
+    promos = _resolve_promos(promo_periods, curve.origin, curve.unit)
+    if cutoffs is None:
+        cutoffs = [t for t, _ in series if t >= min_periods]
+    rows = []
+    for c in cutoffs:
+        c = _resolve_period(c, curve.origin, curve.unit)
+        pre = [p for p in promos if p <= c]
+        dropped = [p for p in promos if p > c]
+        pw = fit_piecewise(_truncated(curve, c), pre,
+                           discount_weight=discount_weight,
+                           smoothing_window=smoothing_window,
+                           min_segment_points=min_segment_points)
+        notes = ([f"promos after the cutoff dropped from the fit: {dropped}"]
+                 if dropped else [])
+        if pw.note:
+            notes.append(pw.note)
+        fitted = [s for s in pw.segments if s.ceiling is not None]
+        K = a = np.nan
+        if fitted:
+            K, a = fitted[-1].ceiling, fitted[-1].a
+            if fitted[-1] is not pw.segments[-1]:
+                notes.append("last segment unfitted: ultimate taken from the "
+                             f"segment @t0={fitted[-1].t0}")
+        rows.append({
+            "cutoff": c,
+            "label": curve.label(c),
+            "K": K,
+            "a": a,
+            "observed_P": obs.get(c, np.nan),
+            "n_segments_fitted": len(fitted),
+            "note": "; ".join(notes),
+        })
+    return pd.DataFrame(rows, columns=["cutoff", "label", "K", "a", "observed_P",
+                                       "n_segments_fitted", "note"])

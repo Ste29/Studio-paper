@@ -38,7 +38,7 @@ def _calendar_ticks(ax, curve, periods: Sequence[int], max_labels: int = 13) -> 
 
 def plot_penetration(curve: PenetrationCurve, *,
                      piecewise: Optional[PiecewiseCurve] = None,
-                     promo_periods: Optional[Sequence[int]] = None,
+                     promo_periods: Optional[Sequence[int | str]] = None,
                      baseline_extension: Optional[int] = None,
                      project_to: Optional[int] = None,
                      ax=None, as_percent: bool = True,

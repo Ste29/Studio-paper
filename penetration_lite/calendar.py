@@ -20,6 +20,7 @@ labels exist for any ordinal >= 1, including projected future periods.
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from typing import Union
 
@@ -103,6 +104,34 @@ def bucket_start(period: int, origin: DateLike, unit: str) -> date:
         return date(mi // 12, mi % 12 + 1, 1)
     days = _BUCKET_DAYS[unit]
     return MONDAY_EPOCH + timedelta(days=(bucket_index(o, unit) + p - 1) * days)
+
+
+_LABEL_RE = re.compile(r"^(\d{4})-(?:([WF])(\d{2})|(\d{2}))$")
+
+
+def parse_period_label(label: str) -> date:
+    """First calendar day of a period label (inverse of :func:`period_label`).
+
+    'YYYY-Www' / 'YYYY-Fww' -> Monday of that ISO week (a fortnight is named
+    after its first week); 'YYYY-MM' -> first of the month. The day is meant to
+    be fed to :func:`period_of`, which maps it into the bucket CONTAINING it --
+    so a weekly label resolves correctly on a fortnight or month axis too.
+    """
+    m = _LABEL_RE.match(label.strip())
+    if not m:
+        raise ValueError(f"cannot parse period label {label!r}: expected "
+                         "'YYYY-Www', 'YYYY-Fww' or 'YYYY-MM'")
+    year = int(m.group(1))
+    if m.group(4) is not None:                       # 'YYYY-MM'
+        month = int(m.group(4))
+        if not 1 <= month <= 12:
+            raise ValueError(f"month out of range in period label {label!r}")
+        return date(year, month, 1)
+    week = int(m.group(3))
+    try:
+        return date.fromisocalendar(year, week, 1)
+    except ValueError as e:
+        raise ValueError(f"invalid ISO week in period label {label!r}: {e}") from e
 
 
 def period_label(period: int, origin: DateLike, unit: str) -> str:

@@ -12,8 +12,9 @@ import pandas as pd
 import pytest
 
 from penetration_lite import (
-    PenetrationCurve, build_penetration, fit, fit_piecewise, period_label,
-    period_of, plot_penetration, pwsd, smoothed_series, stability, validate,
+    PenetrationCurve, build_penetration, fit, fit_piecewise,
+    parse_period_label, period_label, period_of, plot_penetration, pwsd,
+    smoothed_series, stability, stability_piecewise, validate,
 )
 from penetration_lite.calendar import bucket_start
 
@@ -57,6 +58,26 @@ def test_month_ordinals_and_labels():
     assert period_of("2024-02-01", origin, "month") == 4      # cross-year
     assert period_label(1, origin, "month") == "2023-11"
     assert period_label(4, origin, "month") == "2024-02"
+
+
+def test_parse_period_label_roundtrip_and_formats():
+    assert parse_period_label("2024-W16") == date(2024, 4, 15)   # Monday of W16
+    # fortnights are named after the pair's FIRST week: same Monday as the week
+    assert parse_period_label("2023-F52") == date(2023, 12, 25)
+    assert parse_period_label("2023-11") == date(2023, 11, 1)
+    for bad in ("2024-16", "2024-W60", "W16", "2024/W16", "2024-W1"):
+        with pytest.raises(ValueError):
+            parse_period_label(bad)
+
+
+def test_label_resolves_into_containing_bucket():
+    # weekly label on wider axes: the bucket containing the week's Monday.
+    origin = "2024-01-01"
+    # 2024-W18 (Mon 2024-04-29) -> April = 4th month on the axis
+    assert period_of(parse_period_label("2024-W18"), origin, "month") == 4
+    # fortnight bucket 1 = (2023-W52, 2024-W01); W04+W05 form bucket 3
+    assert period_of(parse_period_label("2024-W04"), origin, "iso_fortnight") == 3
+    assert period_of(parse_period_label("2024-W05"), origin, "iso_fortnight") == 3
 
 
 def test_future_labels_exist():
@@ -201,6 +222,24 @@ def test_piecewise_to_frame_has_labels():
     assert "label" in frame.columns and frame["label"].iloc[0] == "2024-01"
 
 
+def test_piecewise_promo_labels_equal_ordinals():
+    c = _curve(_promo_series())                     # iso_week, origin 2024-01-01
+    label = c.label(18)                             # '2024-W18'
+    pw_lab = fit_piecewise(_curve(_promo_series()), [label])
+    pw_ord = fit_piecewise(_curve(_promo_series()), [18])
+    assert pw_lab.promo_periods == pw_ord.promo_periods == [18]
+    assert pw_lab.segments[1].K_inc == pw_ord.segments[1].K_inc
+    assert pw_lab.segments[1].a == pw_ord.segments[1].a
+
+
+def test_piecewise_label_errors_are_readable():
+    c = _curve(_promo_series())                     # 32 observed periods
+    with pytest.raises(ValueError, match=r"2024-W40"):     # beyond the series
+        fit_piecewise(c, ["2024-W40"])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        fit_piecewise(c, ["2024-W18", 18])          # duplicate after resolution
+
+
 # --------------------------------------------------------------------------- #
 # Validation and stability (engine-free)
 # --------------------------------------------------------------------------- #
@@ -232,6 +271,60 @@ def test_stability_converges_and_has_labels():
     assert list(tab.columns) == ["cutoff", "label", "K", "a", "observed_P", "note"]
     tail = tab["K"].tail(3)
     assert (tail - 0.40).abs().max() <= 0.02 and tail.std() <= 0.01
+
+
+def test_validate_accepts_promo_labels():
+    c = _curve(_promo_series())
+    aware_lab = validate(c, cutoff_period=26, promo_periods=[c.label(18)])
+    aware_ord = validate(c, cutoff_period=26, promo_periods=[18])
+    assert aware_lab.pwsd_full == aware_ord.pwsd_full
+
+
+def test_stability_piecewise_converges_and_flags_fallback():
+    c = _curve(_promo_series())                     # promo at 18, K_inc = 0.12
+    tab = stability_piecewise(c, ["2024-W18"]).set_index("cutoff")
+    assert list(tab.columns) == ["label", "K", "a", "observed_P",
+                                 "n_segments_fitted", "note"]
+    # before the promo: single segment, the future promo dropped and noted
+    assert tab.loc[16, "n_segments_fitted"] == 1
+    assert "dropped" in tab.loc[16, "note"]
+    # right after the promo: 2nd segment unfittable -> K falls back, flagged
+    assert tab.loc[20, "n_segments_fitted"] == 1
+    assert "ultimate taken from the segment @t0=0" in tab.loc[20, "note"]
+    # late cutoffs: the composed ultimate stabilises on obs(18) + 0.12
+    target = dict(c.series)[18] + 0.12
+    tail = tab.loc[tab.index >= 28, "K"]
+    assert (tail - target).abs().max() <= 0.02 and tail.std() <= 0.01
+
+
+def test_validate_accepts_cutoff_label():
+    c = _curve(_exp_series(0.40, 0.20, 30))
+    lab = validate(c, cutoff_period=c.label(18))
+    assert lab.cutoff_period == 18
+    assert lab.pwsd_full == validate(c, cutoff_period=18).pwsd_full
+    # weekly label on a month axis: the containing month (Mon 2024-04-29 -> Apr)
+    v = validate(_curve(_exp_series(0.40, 0.20, 12), unit="month"),
+                 cutoff_period="2024-W18")
+    assert v.cutoff_period == 4
+    with pytest.raises(ValueError):
+        validate(c, cutoff_period="2023-11")        # before the launch
+
+
+def test_stability_cutoffs_accept_labels():
+    c = _curve(_promo_series())
+    assert stability(c, cutoffs=[c.label(20), 25]).equals(
+        stability(c, cutoffs=[20, 25]))
+    assert stability_piecewise(c, [18], cutoffs=[c.label(28)]).equals(
+        stability_piecewise(c, [18], cutoffs=[28]))
+
+
+def test_curve_origin_labels():
+    c = _curve(_exp_series(0.40, 0.20, 6))          # origin 2024-01-01
+    assert c.origin_iso_week == "2024-W01"
+    assert c.origin_iso_fortnight == "2023-F52"     # pair (2023-W52, 2024-W01)
+    assert c.origin_month == "2024-01"
+    # unit-independent: a month-axis curve still reports its launch week
+    assert _curve([], unit="month").origin_iso_week == "2024-W01"
 
 
 def test_pwsd_hand_computed():
