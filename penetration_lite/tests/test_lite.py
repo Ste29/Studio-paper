@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from penetration_lite import (
-    PenetrationCurve, build_penetration, fit, fit_piecewise,
+    PenetrationCurve, PiecewiseCurve, build_penetration, fit, fit_piecewise,
     parse_period_label, period_label, period_of, plot_penetration, pwsd,
     smoothed_series, stability, stability_piecewise, validate,
 )
@@ -249,6 +249,17 @@ def test_validate_clean_series():
     assert len(v.actual) == len(v.forecast) == 30
     frame = v.to_frame()
     assert list(frame.columns) == ["period", "label", "actual", "forecast"]
+
+
+def test_validate_curve_is_piecewise_without_promos():
+    c = _curve(_exp_series(0.40, 0.20, 30))
+    v = validate(c, cutoff_period=18)
+    assert isinstance(v.curve, PiecewiseCurve)
+    assert len(v.curve.segments) == 1
+    # the single launch segment equals the plain fit on the training window
+    train = fit(_curve([(t, p) for t, p in c.series if t <= 18]))
+    assert v.curve.ultimate_penetration == pytest.approx(train.K)
+    assert v.curve.segments[0].a == pytest.approx(train.a)
 
 
 def test_validate_promo_aware_beats_plain():

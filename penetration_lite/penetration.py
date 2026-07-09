@@ -416,7 +416,7 @@ class ValidationResult:
     cutoff_period: int
     pwsd_full: Optional[float]
     pwsd_holdout: Optional[float]
-    curve: object                                  # PenetrationCurve | PiecewiseCurve
+    curve: PiecewiseCurve                          # piecewise fit on training data
     actual: List[Tuple[int, float]]
     forecast: List[Tuple[int, Optional[float]]]
     note: str = ""
@@ -437,9 +437,12 @@ def validate(curve: PenetrationCurve, cutoff_period: int | str, *,
              smoothing_window: Optional[int] = None,
              w: float = 0.6) -> ValidationResult:
     """Fit on data up to `cutoff_period`, project the future periods, and score
-    the whole theoretical curve against the full observed series. With
-    `promo_periods` the truncated fit is piecewise promo-aware (promos after
-    the cutoff are unknowable at forecast time: dropped and noted).
+    the whole theoretical curve against the full observed series. The training
+    fit (`ValidationResult.curve`) is always the piecewise composition of
+    :func:`fit_piecewise`: with `promo_periods` it is promo-aware (promos after
+    the cutoff are unknowable at forecast time: dropped and noted); with none
+    on/before the cutoff it reduces to the single launch segment, numerically
+    identical to the plain fit.
 
     `cutoff_period` is a period ordinal (int) or a calendar label resolved to
     the bucket CONTAINING it, as in :func:`fit_piecewise` -- so a weekly label
@@ -463,14 +466,9 @@ def validate(curve: PenetrationCurve, cutoff_period: int | str, *,
     dropped = [p for p in promos if p > cutoff]
     if dropped:
         note_parts.append(f"promos after the cutoff dropped from the fit: {dropped}")
-    fitted_curve: object
-    if pre_promos:
-        fitted_curve = fit_piecewise(train, pre_promos,
-                                     discount_weight=discount_weight,
-                                     smoothing_window=smoothing_window)
-    else:
-        fitted_curve = fit(train, discount_weight=discount_weight,
-                           smoothing_window=smoothing_window)
+    fitted_curve = fit_piecewise(train, pre_promos,
+                                 discount_weight=discount_weight,
+                                 smoothing_window=smoothing_window)
     if fitted_curve.note:
         note_parts.append(fitted_curve.note)
 
