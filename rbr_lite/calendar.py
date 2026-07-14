@@ -1,4 +1,5 @@
-"""Calendar buckets for the lite RBR model (entry-cohort labelling).
+"""Calendar buckets for the lite RBR model (bucket-interval axis and
+cohort-boundary resolution).
 
 Three calendar-anchored units, all with UNIFORM buckets whose position is pure
 date arithmetic (no date dimension, no label->ordinal maps):
@@ -132,6 +133,52 @@ def parse_period_label(label: str) -> date:
         return date.fromisocalendar(year, week, 1)
     except ValueError as e:
         raise ValueError(f"invalid ISO week in period label {label!r}: {e}") from e
+
+
+def is_period_label(x) -> bool:
+    """True when `x` is a string in the period-label grammar
+    ('YYYY-Www' / 'YYYY-Fww' / 'YYYY-MM')."""
+    return isinstance(x, str) and bool(_LABEL_RE.match(x.strip()))
+
+
+def label_last_day(label: str) -> date:
+    """Last calendar day of the labelled bucket: 'YYYY-Www' -> Sunday,
+    'YYYY-Fww' -> the named week's Monday + 13 (a 14-day span), 'YYYY-MM' ->
+    the last day of the month."""
+    start = parse_period_label(label)
+    m = _LABEL_RE.match(label.strip())
+    if m.group(4) is not None:                       # 'YYYY-MM'
+        mi = start.year * 12 + start.month           # index of the NEXT month
+        return date(mi // 12, mi % 12 + 1, 1) - timedelta(days=1)
+    return start + timedelta(days=13 if m.group(2) == "F" else 6)
+
+
+def label_after(label: str) -> str:
+    """Label of the bucket immediately after the labelled one, in the label's
+    own grammar; safe across ISO year boundaries ('2020-W53' -> '2021-W01',
+    '2023-F52' -> '2024-F02', '2023-12' -> '2024-01')."""
+    start = parse_period_label(label)
+    m = _LABEL_RE.match(label.strip())
+    if m.group(4) is not None:                       # 'YYYY-MM'
+        mi = start.year * 12 + start.month
+        return f"{mi // 12:04d}-{mi % 12 + 1:02d}"
+    marker = m.group(2)
+    nxt = start + timedelta(days=14 if marker == "F" else 7)
+    iso = nxt.isocalendar()
+    return f"{iso[0]:04d}-{marker}{iso[1]:02d}"
+
+
+def boundary_end(b: DateLike) -> date:
+    """Inclusive end date of a cohort boundary: a period label maps to the
+    last day of its bucket, anything else is coerced via :func:`as_date`."""
+    if is_period_label(b):
+        return label_last_day(b)
+    try:
+        return as_date(b)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"cannot interpret cohort boundary {b!r}: expected a period label "
+            "('YYYY-Www' / 'YYYY-Fww' / 'YYYY-MM') or a date") from e
 
 
 def period_label(period: int, origin: DateLike, unit: str) -> str:

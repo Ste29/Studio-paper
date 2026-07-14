@@ -2,17 +2,21 @@
 
 RBR(t) is the brand's share of the category volume bought by its triers in
 their t-th interval after trial: Σ brand_qty(t) / Σ cat_qty(t), a RATIO OF
-SUMS (never a mean of per-shopper ratios). Intervals are exact
-``period_length_days``-day windows counted from each shopper's OWN trial date
-(interval t covers days (t-1)*P+1 .. t*P after the trial, 1-based), so the
-axis is repeat-buying time, not calendar time. Only fully-elapsed intervals
-count: a shopper contributes to interval t only when its whole window fits
-before the analysis date, and lapsed buyers stay in the denominator base
-(``n_eligible`` comes from elapsed time, not from purchasing).
+SUMS (never a mean of per-shopper ratios). The axis is repeat-buying time,
+not calendar time, in one of two flavours: exact ``period_length_days``-day
+windows counted from each shopper's OWN trial date (interval t covers days
+(t-1)*P+1 .. t*P after the trial, 1-based), or -- with ``interval_unit`` set
+-- calendar-bucket differences from the trial's bucket (the next iso_week /
+iso_fortnight / month is interval 1; purchases in the trial's own bucket are
+never repeats). Only fully-elapsed intervals count: a shopper contributes to
+interval t only when its whole window (or bucket) fits before the analysis
+date, and lapsed buyers stay in the denominator base (``n_eligible`` comes
+from elapsed time, not from purchasing).
 
-Entry cohorts (optional) are the calendar bucket of the trial date -- iso_week
-/ iso_fortnight / month -- for the "do late triers repeat like the early
-ones?" diagnostic.
+Entry cohorts (optional) are custom bands of the trial date delimited by
+``cohort_boundaries`` -- period labels or dates, each closing a band
+inclusively -- for the "do late triers repeat like the early ones?"
+diagnostic.
 
 Spark is used ONLY inside :func:`build_rbr` (per-card trial identification and
 two per-interval group-bys whose collected result is one row per interval);
@@ -21,13 +25,16 @@ everything else is numpy/pandas on the small series.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .calendar import _check_unit, as_date, period_col, period_label
+from .calendar import (
+    _check_unit, as_date, boundary_end, is_period_label, label_after,
+    period_col, period_of,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -45,14 +52,16 @@ class RBRPoint:
 
 @dataclass
 class RBRCurve:
-    """Pooled RBR(t) on exact-day intervals from each shopper's trial, plus
-    the optional per-cohort volumes behind the cohort diagnostic."""
+    """Pooled RBR(t) on exact-day or calendar-bucket intervals from each
+    shopper's trial, plus the optional per-band volumes behind the cohort
+    diagnostic."""
     origin: date                          # launch (trial floor when launch_date given)
     analysis_date: date
-    period_length_days: int
+    period_length_days: Optional[int]     # exact-day window; None in bucket mode
     points: List[RBRPoint]                # gap-free 1..upper (zero-filled)
     n_triers: int                         # ALL triers, incl. max_interval == 0
-    cohort_unit: Optional[str] = None     # 'iso_week' | 'iso_fortnight' | 'month'
+    interval_unit: Optional[str] = None   # 'iso_week' | 'iso_fortnight' | 'month'
+    cohort_labels: Optional[List[str]] = None    # ALL bands, band order
     cohort_table: Optional[pd.DataFrame] = None  # cohort, interval, brand_qty, cat_qty
 
     def to_frame(self) -> pd.DataFrame:
@@ -88,20 +97,24 @@ class RBRCurve:
     def _require_cohorts(self) -> pd.DataFrame:
         if self.cohort_table is None:
             raise ValueError("curve built without cohorts: pass "
-                             "cohort_unit=... to build_rbr")
+                             "cohort_boundaries=[...] to build_rbr")
         return self.cohort_table
 
     def cohort_series(self) -> Dict[str, List[Tuple[int, Optional[float]]]]:
-        """Ordered {cohort label: [(interval, rbr | None), ...]} -- the full
-        per-cohort curves behind the cohort diagnostic plot. rbr is None when
-        no category volume is observed yet; cohorts with no rows are omitted.
-        Labels ('YYYY-Www' / 'YYYY-Fww' / 'YYYY-MM') sort chronologically."""
+        """Ordered {band label: [(interval, rbr | None), ...]} -- the full
+        per-band curves behind the cohort diagnostic plot. rbr is None when
+        no category volume is observed yet; bands with no rows are omitted.
+        Iteration follows band order (`cohort_labels`), never label sort."""
         table = self._require_cohorts()
         out: Dict[str, List[Tuple[int, Optional[float]]]] = {}
         if table.empty:
             return out
-        for label in sorted(table["cohort"].unique()):
+        order = (self.cohort_labels if self.cohort_labels is not None
+                 else list(pd.unique(table["cohort"])))
+        for label in order:
             grp = table[table["cohort"] == label]
+            if grp.empty:
+                continue
             pts: List[Tuple[int, Optional[float]]] = []
             for r in grp.sort_values("interval").itertuples(index=False):
                 cat = float(r.cat_qty)
@@ -151,6 +164,44 @@ def stable_rbr(points: Sequence[RBRPoint], from_interval: int) -> Optional[float
 
 
 # --------------------------------------------------------------------------- #
+# Cohort boundary resolution (pure Python, fail-fast before Spark is touched)
+# --------------------------------------------------------------------------- #
+def _resolve_cohort_boundaries(boundaries) -> Tuple[List[date], List[str]]:
+    """Boundary tokens -> (inclusive end dates, band labels). N boundaries
+    delimit N+1 bands: band k holds triers with end_{k-1} < trial <= end_k
+    (the first band starts at the origin, the last is open-ended)."""
+    bs = list(boundaries)
+    if not bs:
+        raise ValueError("cohort_boundaries must contain at least one "
+                         "boundary (pass None to skip cohorts)")
+    ends = [boundary_end(b) for b in bs]
+    for prev_b, prev_e, cur_b, cur_e in zip(bs, ends, bs[1:], ends[1:]):
+        if prev_e >= cur_e:
+            raise ValueError(
+                "cohort_boundaries must resolve to strictly increasing end "
+                f"dates: {prev_b!r} -> {prev_e} is not before "
+                f"{cur_b!r} -> {cur_e}")
+    return ends, _band_labels(bs)
+
+
+def _band_labels(bs) -> List[str]:
+    """Human-readable band labels, e.g. ['≤2023-W31', '2023-W32–2023-W38',
+    '2023-W39+']: each boundary rendered as typed (labels keep their grammar,
+    dates -> ISO), band starts derived from the previous boundary."""
+    def tok(b):
+        return b.strip() if is_period_label(b) else as_date(b).isoformat()
+
+    def nxt(b):   # first token AFTER the boundary: next bucket, or end + 1 day
+        return (label_after(b) if is_period_label(b)
+                else (as_date(b) + timedelta(days=1)).isoformat())
+
+    labels = [f"≤{tok(bs[0])}"]
+    labels += [f"{nxt(p)}–{tok(c)}" for p, c in zip(bs, bs[1:])]
+    labels.append(f"{nxt(bs[-1])}+")
+    return labels
+
+
+# --------------------------------------------------------------------------- #
 # The single Spark entry point
 # --------------------------------------------------------------------------- #
 def build_rbr(sdf, *, card_col: str = "shopper_id",
@@ -158,9 +209,10 @@ def build_rbr(sdf, *, card_col: str = "shopper_id",
               brand_col: str = "is_new_product",
               category_col: str = "is_category",
               qty_col: str = "volume",
-              period_length_days: int = 28,
+              period_length_days: Optional[int] = None,
+              interval_unit: Optional[str] = None,
               max_interval: Optional[int] = None,
-              cohort_unit: Optional[str] = None,
+              cohort_boundaries: Optional[Sequence] = None,
               launch_date=None, analysis_date=None) -> RBRCurve:
     """Build the pooled (and optionally per-cohort) RBR curve from a Spark
     transaction log.
@@ -170,17 +222,46 @@ def build_rbr(sdf, *, card_col: str = "shopper_id",
     launch (with `launch_date` set, earlier brand history is ignored and the
     trial re-dated to the first post-launch brand purchase). Purchases on the
     trial day itself never count as repeats; interval t only enters the curve
-    once its whole window has elapsed for that shopper. `max_interval` caps
-    the horizon of the WHOLE analysis (pooled and cohort curves alike);
-    `n_eligible` still counts every trier whose window has elapsed, including
-    those observable beyond the cap.
+    once its whole window has elapsed for that shopper.
+
+    Two interval axes: with `interval_unit=None` intervals are exact
+    `period_length_days`-day windows from the trial (default 28); with
+    `interval_unit` set ('iso_week' / 'iso_fortnight' / 'month') the interval
+    is the calendar-bucket difference from the trial's bucket -- purchases in
+    the trial's own bucket are never repeats, and a bucket counts only once
+    it has FULLY elapsed by the analysis date (a partial current bucket is
+    excluded). `period_length_days` must not be passed in bucket mode.
+
+    `cohort_boundaries` (optional) splits triers into entry bands: each
+    boundary -- a period label ('YYYY-Www' / 'YYYY-Fww' / 'YYYY-MM', mixed
+    grammars allowed) or a date -- closes a band at the last day of its
+    bucket (labels) or at itself (dates), inclusive. N boundaries give N+1
+    bands; the first starts at the origin, the last stays open until the
+    analysis date.
+
+    The horizon is chosen with `analysis_date` (observation cutoff, default =
+    last transaction) and `max_interval`, which caps the axis of the WHOLE
+    analysis (pooled and cohort curves alike) -- e.g. interval_unit='month',
+    max_interval=20 gives at most 20 monthly points. `n_eligible` still
+    counts every trier whose window has elapsed, including those observable
+    beyond the cap.
     """
-    if period_length_days <= 0:
-        raise ValueError("period_length_days must be positive")
+    if interval_unit is not None:
+        _check_unit(interval_unit)
+        if period_length_days is not None:
+            raise ValueError("period_length_days does not apply when "
+                             "interval_unit is set: bucket intervals have "
+                             "calendar length")
+        plen = None
+    else:
+        plen = 28 if period_length_days is None else int(period_length_days)
+        if plen <= 0:
+            raise ValueError("period_length_days must be positive")
     if max_interval is not None and max_interval < 1:
         raise ValueError("max_interval must be >= 1 (an RBR interval)")
-    if cohort_unit is not None:
-        _check_unit(cohort_unit)
+    ends = band_labels = None
+    if cohort_boundaries is not None:
+        ends, band_labels = _resolve_cohort_boundaries(cohort_boundaries)
     from pyspark.sql import functions as F
 
     p = (sdf.withColumn("_ts", F.to_date(F.col(date_col)))
@@ -210,19 +291,47 @@ def build_rbr(sdf, *, card_col: str = "shopper_id",
                              "or ensure there is at least one brand purchase")
         origin = as_date(o)
 
+    if ends is not None:
+        bs = list(cohort_boundaries)
+        if ends[0] < origin:
+            raise ValueError(
+                f"cohort boundary {bs[0]!r} resolves to {ends[0]}, before "
+                f"the origin {origin}: its band would be empty")
+        if ends[-1] >= adate:
+            raise ValueError(
+                f"cohort boundary {bs[-1]!r} resolves to {ends[-1]}, on/after "
+                f"the analysis date {adate}: the open last band would be empty")
+
     # Trials: first brand purchase per card, floored at the launch. Everything
     # stays a Spark column; only per-interval aggregates are collected.
     brand = p.filter(F.col("_brand"))
     if launch_date is not None:
         brand = brand.filter(F.col("_ts") >= F.lit(origin.isoformat()).cast("date"))
     adate_lit = F.lit(adate.isoformat()).cast("date")
-    trials = (brand.groupBy("_card").agg(F.min("_ts").alias("_trial_ts"))
-              .withColumn("_max_interval",
-                          F.floor(F.datediff(adate_lit, F.col("_trial_ts"))
-                                  / period_length_days)))
-    if cohort_unit is not None:
+    trials = brand.groupBy("_card").agg(F.min("_ts").alias("_trial_ts"))
+    if interval_unit is None:
         trials = trials.withColumn(
-            "_cohort_ord", period_col(F, F.col("_trial_ts"), cohort_unit, origin))
+            "_max_interval",
+            F.floor(F.datediff(adate_lit, F.col("_trial_ts")) / plen))
+    else:
+        # Buckets FULLY elapsed by the analysis date: (B(adate+1d) - 1) -
+        # B(trial). The +1 day rolls the bucket index forward exactly when
+        # adate closes its bucket (month ends included), so a partial current
+        # bucket never counts. Can be negative for a trial inside adate's
+        # unfinished bucket; the dist / seed / filters below absorb that.
+        k = period_of(adate + timedelta(days=1), origin, interval_unit) - 1
+        trials = trials.withColumn(
+            "_max_interval",
+            F.lit(int(k)) - period_col(F, F.col("_trial_ts"),
+                                       interval_unit, origin))
+    if ends is not None:
+        band = F.when(F.col("_trial_ts")
+                      <= F.lit(ends[0].isoformat()).cast("date"), F.lit(0))
+        for i in range(1, len(ends)):
+            band = band.when(F.col("_trial_ts")
+                             <= F.lit(ends[i].isoformat()).cast("date"), F.lit(i))
+        trials = trials.withColumn("_cohort_idx",
+                                   band.otherwise(F.lit(len(ends))))
     trials = trials.cache()
 
     joined = None
@@ -251,13 +360,16 @@ def build_rbr(sdf, *, card_col: str = "shopper_id",
         # eligibility filter (only fully-elapsed windows; lapsed buyers stay
         # in the base) and the analysis-horizon cap.
         cols = ["_card", "_trial_ts", "_max_interval"]
-        if cohort_unit is not None:
-            cols.append("_cohort_ord")
+        if ends is not None:
+            cols.append("_cohort_idx")
+        if interval_unit is None:
+            ival = F.ceil(F.datediff(F.col("_ts"), F.col("_trial_ts")) / plen)
+        else:
+            ival = (period_col(F, F.col("_ts"), interval_unit, origin)
+                    - period_col(F, F.col("_trial_ts"), interval_unit, origin))
         joined = (p.join(trials.select(*cols), on="_card", how="inner")
                   .filter(F.datediff(F.col("_ts"), F.col("_trial_ts")) > 0)
-                  .withColumn("_interval",
-                              F.ceil(F.datediff(F.col("_ts"), F.col("_trial_ts"))
-                                     / period_length_days))
+                  .withColumn("_interval", ival)
                   .filter((F.col("_interval") >= 1)
                           & (F.col("_interval") <= F.col("_max_interval"))
                           & (F.col("_interval") <= F.lit(upper)))
@@ -276,19 +388,19 @@ def build_rbr(sdf, *, card_col: str = "shopper_id",
                                    n_eligible=n_eligible.get(t, 0)))
 
         cohort_table = None
-        if cohort_unit is not None:
-            rows = (joined.groupBy("_cohort_ord", "_interval")
+        if ends is not None:
+            rows = (joined.groupBy("_cohort_idx", "_interval")
                     .agg(F.sum("_bq").alias("brand_qty"),
                          F.sum("_cq").alias("cat_qty")).toPandas())
             if rows.empty:
                 cohort_table = pd.DataFrame(
                     columns=["cohort", "interval", "brand_qty", "cat_qty"])
             else:
-                rows["cohort"] = [period_label(int(o), origin, cohort_unit)
-                                  for o in rows["_cohort_ord"]]
+                rows["cohort"] = [band_labels[int(i)]
+                                  for i in rows["_cohort_idx"]]
                 rows["interval"] = rows["_interval"].astype(int)
-                cohort_table = (rows[["cohort", "interval", "brand_qty", "cat_qty"]]
-                                .sort_values(["cohort", "interval"])
+                cohort_table = (rows.sort_values(["_cohort_idx", "interval"])
+                                [["cohort", "interval", "brand_qty", "cat_qty"]]
                                 .reset_index(drop=True))
     finally:
         trials.unpersist()
@@ -296,6 +408,6 @@ def build_rbr(sdf, *, card_col: str = "shopper_id",
             joined.unpersist()
 
     return RBRCurve(origin=origin, analysis_date=adate,
-                    period_length_days=int(period_length_days), points=points,
-                    n_triers=n_triers, cohort_unit=cohort_unit,
-                    cohort_table=cohort_table)
+                    period_length_days=plen, points=points,
+                    n_triers=n_triers, interval_unit=interval_unit,
+                    cohort_labels=band_labels, cohort_table=cohort_table)

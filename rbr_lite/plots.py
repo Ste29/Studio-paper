@@ -28,6 +28,8 @@ def _ax(ax):
 
 
 def _xlabel(curve: RBRCurve) -> str:
+    if curve.interval_unit is not None:
+        return f"Interval after first purchase (t, {curve.interval_unit} buckets)"
     return f"Interval after first purchase (t, {curve.period_length_days}-day)"
 
 
@@ -59,9 +61,9 @@ def plot_rbr(curve: RBRCurve, *, ax=None, mark_plateau: bool = False,
 def plot_rbr_cohorts(curve: RBRCurve, *, ax=None, as_percent: bool = True,
                      show_pooled: bool = True,
                      title: str = "Repeat-buying rate by entry cohort"):
-    """Diagnostic RBR(t) per entry cohort (one line each, chronological order),
-    with the pooled curve as a thick grey reference. Diverging cohort curves
-    flag entry-wave differences (late triers repeating unlike the early ones)."""
+    """Diagnostic RBR(t) per entry cohort (one line each, band order), with
+    the pooled curve as a thick grey reference. Diverging cohort curves flag
+    entry-wave differences (late triers repeating unlike the early ones)."""
     ax = _ax(ax)
     scale = 100.0 if as_percent else 1.0
     unit = "%" if as_percent else ""
